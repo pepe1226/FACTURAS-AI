@@ -1,0 +1,1279 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React, { useMemo, useRef, useState, useEffect, useCallback } from "react";
+import { GoogleGenAI, Type, GenerateContentResponse } from "@google/genai";
+import { 
+  Upload, 
+  FileText, 
+  CheckCircle2, 
+  AlertCircle, 
+  Download, 
+  Trash2, 
+  Copy,
+  Search,
+  LayoutDashboard,
+  Receipt,
+  Info,
+  Loader2,
+  ChevronDown,
+  ChevronUp,
+  FilterX,
+  Sigma,
+  Check,
+  MoreVertical
+} from "lucide-react";
+import { motion, AnimatePresence } from "motion/react";
+
+// =====================================================
+// Types & Constants
+// =====================================================
+
+type TaxCategory = "IVA_15" | "IVA_0" | "UNKNOWN";
+type InvoiceStatus = "OK" | "REVIEW";
+
+interface InvoiceItem {
+  barcode: string;
+  product: string;
+  quantity: number;
+  finalUnitCost: number;
+  finalTotalCost: number;
+  taxCategory?: TaxCategory;
+  confidence?: number;
+}
+
+interface InvoiceResult {
+  id: string;
+  fileName: string;
+  supplier?: string;
+  invoiceNumber?: string;
+  invoiceDate?: string;
+  invoiceTotalPaid: number;
+  currency: "USD";
+  items: InvoiceItem[];
+  status: InvoiceStatus;
+  difference: number;
+  notes: string[];
+  error?: string;
+}
+
+type SortField = "barcode" | "product" | "quantity" | "finalUnitCost" | "finalTotalCost";
+type SortOrder = "asc" | "desc" | null;
+type AggregationType = "sum" | "count" | "avg" | "min" | "max";
+
+const DEFAULT_ECUADOR_VAT_RATE = 0.15;
+
+const EXTRACTION_PROMPT = `
+Eres un extractor experto de comprobantes, tickets y facturas de Ecuador. Tu misión es la precisión absoluta.
+
+INSTRUCCIONES CRÍTICAS:
+1. DETECCIÓN DE IVA: Mapea cada producto a 'IVA_15' (si es gravado) o 'IVA_0' (si no lo es). 
+   - Busca indicadores como asteriscos (*), la letra 'G', o columnas marcadas como 'IVA' o '%'.
+   - Si un producto es procesado, enlatado o un servicio, usualmente lleva IVA_15.
+   - Si es un alimento básico, medicina o libros, usualmente es IVA_0.
+2. COSTO FINAL: El 'finalTotalCost' DEBE ser el valor total por esa línea INCLUYENDO IVA y descontando cualquier rebaja.
+3. CONCORDANCIA: La suma de todos los 'finalTotalCost' DEBE ser IGUAL al 'invoiceTotalPaid' del documento.
+4. FORMATO: Devuelve exclusivamente el JSON siguiendo el esquema.
+5. CÓDIGOS (CÓDIGO DE BARRAS): Busca el código numérico al lado de cada producto o debajo del nombre. 
+   - Busca códigos de 7, 8 o 13 dígitos (EAN-8, EAN-13).
+   - A veces aparece como 'Código', 'Ref', 'Cod. Art'. 
+   - Si no existe un código claro, deja "".
+`;
+
+// =====================================================
+// Utility Functions
+// =====================================================
+
+function roundMoney(value: number): number {
+  return Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
+}
+
+function sumItems(items: InvoiceItem[]): number {
+  return roundMoney(items.reduce((acc, item) => acc + Number(item.finalTotalCost || 0), 0));
+}
+
+function normalizeItemsToInvoiceTotal(items: InvoiceItem[], invoiceTotalPaid: number): InvoiceItem[] {
+  const currentSum = sumItems(items);
+  const target = roundMoney(invoiceTotalPaid);
+  const diff = roundMoney(target - currentSum);
+
+  if (Math.abs(diff) <= 0.001 || items.length === 0) return items;
+
+  // Distribute difference to the most expensive item to minimize percentage impact
+  const maxIndex = items.reduce((best, item, index, array) => {
+    return Number(item.finalTotalCost || 0) > Number(array[best].finalTotalCost || 0) ? index : best;
+  }, 0);
+
+  return items.map((item, index) => {
+    if (index !== maxIndex) return item;
+
+    const newTotal = roundMoney(Number(item.finalTotalCost || 0) + diff);
+    const safeQuantity = Math.max(Number(item.quantity || 1), 1);
+
+    return {
+      ...item,
+      finalTotalCost: newTotal,
+      finalUnitCost: roundMoney(newTotal / safeQuantity),
+    };
+  });
+}
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      const base64 = result.split(",")[1];
+      resolve(base64);
+    };
+    reader.onerror = () => reject(new Error("No se pudo leer el archivo."));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function optimizeImage(base64: string, maxDimension = 2048): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      let width = img.width;
+      let height = img.height;
+
+      if (width > maxDimension || height > maxDimension) {
+        if (width > height) {
+          height *= maxDimension / width;
+          width = maxDimension;
+        } else {
+          width *= maxDimension / height;
+          height = maxDimension;
+        }
+      }
+
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        resolve(base64);
+        return;
+      }
+      ctx.drawImage(img, 0, 0, width, height);
+      // Return highly compressed but legible jpeg base64
+      resolve(canvas.toDataURL("image/jpeg", 0.8).split(",")[1]);
+    };
+    img.onerror = () => reject(new Error("Error al optimizar la imagen."));
+    img.src = `data:image/jpeg;base64,${base64}`;
+  });
+}
+
+// =====================================================
+// Components
+// =====================================================
+
+export default function App() {
+  const [results, setResults] = useState<InvoiceResult[]>(() => {
+    try {
+      const saved = localStorage.getItem("facturas_ai_results");
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [loadingPhase, setLoadingPhase] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  
+  // Sorting & Filtering
+  const [sortField, setSortField] = useState<SortField | null>(null);
+  const [sortOrder, setSortOrder] = useState<SortOrder>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number, y: number, field: SortField } | null>(null);
+  const [columnSearch, setColumnSearch] = useState<Partial<Record<SortField, string>>>({});
+  const [activeSearchField, setActiveSearchField] = useState<SortField | null>(null);
+  const [aggType, setAggType] = useState<AggregationType>("sum");
+  const [isAggMenuOpen, setIsAggMenuOpen] = useState(false);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [copiedCellId, setCopiedCellId] = useState<string | null>(null);
+  const [deleteConfirmation, setDeleteConfirmation] = useState<{ invoiceId: string, itemIndex: number, productName: string } | null>(null);
+  
+  const [uploadContextMenu, setUploadContextMenu] = useState<{ x: number, y: number } | null>(null);
+  
+  const ai = useMemo(() => new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" }), []);
+
+  const handleUploadContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault();
+    setUploadContextMenu({ x: e.clientX, y: e.clientY });
+  };
+
+  const closeUploadContextMenu = () => setUploadContextMenu(null);
+
+  const handlePasteFromClipboard = async () => {
+    if (!navigator.clipboard || !navigator.clipboard.read) {
+      setError("Tu navegador no permite el acceso directo al portapapeles. Por favor usa Ctrl+V.");
+      closeUploadContextMenu();
+      return;
+    }
+
+    try {
+      const clipboardItems = await navigator.clipboard.read();
+      let foundImage = false;
+      for (const item of clipboardItems) {
+        for (const type of item.types) {
+          if (type.startsWith("image/")) {
+            const blob = await item.getType(type);
+            const file = new File([blob], `pasted-image-${Date.now()}.png`, { type });
+            setSelectedFile(file);
+            setError(null);
+            foundImage = true;
+            break;
+          }
+        }
+        if (foundImage) break;
+      }
+      
+      if (!foundImage) {
+        setError("No se encontró ninguna imagen en el portapapeles.");
+      }
+      closeUploadContextMenu();
+    } catch (err) {
+      console.error("Clipboard Error:", err);
+      if (err instanceof Error && err.name === "NotAllowedError") {
+        setError("Permiso denegado para acceder al portapapeles. Habilita el acceso en tu navegador o usa Ctrl+V.");
+      } else {
+        setError("No se pudo acceder al portapapeles debido a restricciones de seguridad. Por favor usa Ctrl+V.");
+      }
+      closeUploadContextMenu();
+    }
+  };
+
+  // Demo data for initial view as seen in screenshot
+  useEffect(() => {
+    const hasVisited = localStorage.getItem("facturas_ai_visited");
+    if (!hasVisited && results.length === 0) {
+      setResults([{
+        id: "demo-1",
+        fileName: "comprobante_demo.jpg",
+        supplier: "Producto Demo",
+        invoiceNumber: "001-001",
+        invoiceDate: "2024-05-08",
+        invoiceTotalPaid: 7.45,
+        currency: "USD",
+        items: [
+          { barcode: "7861001200012", product: "Producto demo detectado A", quantity: 2, finalUnitCost: 1.25, finalTotalCost: 2.50, taxCategory: "IVA_15" },
+          { barcode: "7862103400098", product: "Producto demo detectado B", quantity: 1, finalUnitCost: 3.20, finalTotalCost: 3.20, taxCategory: "IVA_15" },
+          { barcode: "", product: "Producto demo sin código", quantity: 1, finalUnitCost: 1.75, finalTotalCost: 1.75, taxCategory: "IVA_0" },
+        ],
+        status: "OK",
+        difference: 0,
+        notes: ["Datos de ejemplo"],
+      }]);
+      localStorage.setItem("facturas_ai_visited", "true");
+    }
+  }, []);
+
+  // Save to localStorage
+  useEffect(() => {
+    localStorage.setItem("facturas_ai_results", JSON.stringify(results));
+  }, [results]);
+
+  const handleFileUpload = (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    setSelectedFile(files[0]);
+    setError(null);
+  };
+
+  useEffect(() => {
+    const handlePaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+
+      for (let i = 0; i < items.length; i++) {
+        if (items[i].type.indexOf("image") !== -1) {
+          const blob = items[i].getAsFile();
+          if (blob) {
+            const file = new File([blob], `pasted-image-${Date.now()}.png`, { type: blob.type });
+            setSelectedFile(file);
+            setError(null);
+          }
+        }
+      }
+    };
+
+    window.addEventListener("paste", handlePaste);
+    return () => window.removeEventListener("paste", handlePaste);
+  }, []);
+
+  const processFile = async () => {
+    if (!selectedFile) return;
+    
+    setIsLoading(true);
+    setProgress(5);
+    setLoadingPhase("Leyendo archivo...");
+    setError(null);
+
+    try {
+      const initialBase64 = await fileToBase64(selectedFile);
+      setProgress(15);
+      
+      let base64 = initialBase64;
+      const isXml = selectedFile.type.includes("xml") || selectedFile.name.toLowerCase().endsWith(".xml");
+      
+      if (selectedFile.type.startsWith("image/")) {
+        setLoadingPhase("Optimizando imagen...");
+        try {
+          base64 = await optimizeImage(initialBase64);
+        } catch (e) {
+          console.warn("Resizing failed, using original", e);
+        }
+      } else if (isXml) {
+        setLoadingPhase("Leyendo XML...");
+      } else {
+        setLoadingPhase("Preparando documento...");
+      }
+
+      setProgress(25);
+      setLoadingPhase("Analizando con IA...");
+      
+      const contentParts: any[] = [{ text: EXTRACTION_PROMPT }];
+      
+      if (isXml) {
+        const xmlText = await selectedFile.text();
+        contentParts.push({ text: `CONTENIDO XML FACTURA ELECTRÓNICA ECUADOR:\n\n${xmlText}` });
+      } else {
+        contentParts.push({
+          inlineData: {
+            mimeType: selectedFile.type || "image/jpeg",
+            data: base64,
+          },
+        });
+      }
+      
+      const response: GenerateContentResponse = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: contentParts,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              supplier: { type: Type.STRING },
+              invoiceNumber: { type: Type.STRING },
+              invoiceDate: { type: Type.STRING },
+              invoiceTotalPaid: { type: Type.NUMBER },
+              currency: { type: Type.STRING },
+              items: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    barcode: { type: Type.STRING },
+                    product: { type: Type.STRING },
+                    quantity: { type: Type.NUMBER },
+                    finalUnitCost: { type: Type.NUMBER },
+                    finalTotalCost: { type: Type.NUMBER },
+                    taxCategory: { type: Type.STRING, enum: ["IVA_15", "IVA_0", "UNKNOWN"] },
+                  },
+                  required: ["product", "quantity", "finalTotalCost"]
+                }
+              },
+              notes: { type: Type.ARRAY, items: { type: Type.STRING } }
+            },
+            required: ["invoiceTotalPaid", "items"]
+          },
+        }
+      });
+
+      setProgress(70);
+      setLoadingPhase("Procesando respuesta...");
+
+      const rawData = JSON.parse(response.text || "{}");
+      
+      setProgress(85);
+      setLoadingPhase("Calculando cuadrados...");
+
+      const normalizedItems = normalizeItemsToInvoiceTotal(
+        rawData.items || [], 
+        rawData.invoiceTotalPaid || 0
+      );
+      
+      const totalItems = sumItems(normalizedItems);
+      const difference = roundMoney((rawData.invoiceTotalPaid || 0) - totalItems);
+
+      const newResult: InvoiceResult = {
+        id: crypto.randomUUID(),
+        fileName: selectedFile.name,
+        supplier: rawData.supplier || "Desconocido",
+        invoiceNumber: rawData.invoiceNumber || "",
+        invoiceDate: rawData.invoiceDate || "",
+        invoiceTotalPaid: rawData.invoiceTotalPaid || 0,
+        currency: "USD",
+        items: normalizedItems,
+        status: Math.abs(difference) <= 0.01 ? "OK" : "REVIEW",
+        difference,
+        notes: rawData.notes || [],
+      };
+
+      setProgress(95);
+      setLoadingPhase("Finalizando...");
+
+      setResults(prev => [newResult, ...prev.filter(r => !r.id.startsWith('demo'))]);
+      setSelectedFile(null);
+      setProgress(100);
+      
+      setTimeout(() => {
+        setIsLoading(false);
+        setProgress(0);
+        setLoadingPhase("");
+      }, 500);
+    } catch (err) {
+      console.error("Error processing file:", err);
+      setError(`Error al procesar: ${err instanceof Error ? err.message : "Error desconocido"}`);
+      setIsLoading(false);
+      setProgress(0);
+      setLoadingPhase("");
+    }
+  };
+
+  const normalize = (str: string) => 
+    str.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+
+  const matchesSearch = (text: string, query: string) => {
+    if (!query) return true;
+    const normalizedText = normalize(text);
+    const words = normalize(query).split(/\s+/).filter(Boolean);
+    return words.every(word => normalizedText.includes(word));
+  };
+
+  const filteredRows = useMemo(() => {
+    let allRows = results.flatMap(invoice => 
+      invoice.items.map((item, idx) => ({ 
+        ...item, 
+        supplier: invoice.supplier, 
+        fileName: invoice.fileName, 
+        invoiceId: invoice.id,
+        itemIndex: idx,
+        rowId: `${invoice.id}-${idx}`
+      }))
+    );
+    
+    // Search filter (Global)
+    if (searchQuery) {
+      allRows = allRows.filter(row => 
+        matchesSearch(row.product, searchQuery) || 
+        matchesSearch(row.barcode, searchQuery)
+      );
+    }
+
+    // Column specific filters
+    (Object.entries(columnSearch) as [SortField, string][]).forEach(([field, value]) => {
+      if (!value) return;
+      allRows = allRows.filter(row => {
+        const rowValue = String(row[field as keyof typeof row] || "");
+        return matchesSearch(rowValue, value);
+      });
+    });
+
+    // Sort order
+    if (sortField && sortOrder) {
+      allRows.sort((a, b) => {
+        const valA = a[sortField];
+        const valB = b[sortField];
+        
+        if (typeof valA === "string" && typeof valB === "string") {
+          return sortOrder === "asc" ? valA.localeCompare(valB) : valB.localeCompare(valA);
+        }
+        
+        if (typeof valA === "number" && typeof valB === "number") {
+          return sortOrder === "asc" ? valA - valB : valB - valA;
+        }
+        
+        return 0;
+      });
+    }
+    
+    return allRows;
+  }, [results, searchQuery, sortField, sortOrder, columnSearch]);
+
+  const totalInvoiceSum = useMemo(() => 
+    roundMoney(filteredRows.reduce((acc, curr) => acc + curr.finalTotalCost, 0)), 
+  [filteredRows]);
+
+  const aggResult = useMemo(() => {
+    if (filteredRows.length === 0) return 0;
+    
+    switch (aggType) {
+      case "count": return filteredRows.length;
+      case "avg": return roundMoney(filteredRows.reduce((acc, curr) => acc + curr.finalTotalCost, 0) / filteredRows.length);
+      case "min": return Math.min(...filteredRows.map(r => r.finalTotalCost));
+      case "max": return Math.max(...filteredRows.map(r => r.finalTotalCost));
+      case "sum":
+      default:
+        return roundMoney(filteredRows.reduce((acc, curr) => acc + curr.finalTotalCost, 0));
+    }
+  }, [filteredRows, aggType]);
+
+  const aggLabel = useMemo(() => {
+    switch (aggType) {
+      case "count": return "Número de elementos";
+      case "avg": return "Promedio";
+      case "min": return "Mínimo";
+      case "max": return "Máximo";
+      case "sum":
+      default:
+        return "Suma Total";
+    }
+  }, [aggType]);
+
+  const exportCSV = () => {
+    const headers = ["Fecha", "Proveedor", "Producto", "Código", "Cantidad", "Precio Unit", "Total", "IVA", "Archivo"];
+    const csvData = filteredRows.map(row => {
+      const inv = results.find(r => r.id === row.invoiceId);
+      const rowData = [
+        inv?.invoiceDate || "",
+        row.supplier || "",
+        row.product || "",
+        row.barcode || "",
+        row.quantity,
+        row.finalUnitCost.toFixed(4),
+        row.finalTotalCost.toFixed(2),
+        row.taxCategory || "UNKNOWN",
+        row.fileName || ""
+      ];
+      // Escape each field and join with semicolon
+      return rowData.map(val => {
+        const strVal = String(val).replace(/"/g, '""');
+        return `"${strVal}"`;
+      }).join(";");
+    });
+
+    // Add Byte Order Mark (BOM) for correct UTF-8 encoding in Excel
+    const BOM = "\uFEFF";
+    const csvContent = BOM + [headers.join(";"), ...csvData].join("\n");
+    
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", `reporte_inventario_${new Date().toISOString().split('T')[0]}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const deleteItem = (invoiceId: string, itemIndex: number, productName: string) => {
+    setDeleteConfirmation({ invoiceId, itemIndex, productName });
+  };
+
+  const confirmDelete = () => {
+    if (!deleteConfirmation) return;
+    const { invoiceId, itemIndex } = deleteConfirmation;
+    
+    setResults(prev => prev.map(inv => {
+      if (inv.id === invoiceId) {
+        return {
+          ...inv,
+          items: inv.items.filter((_, i) => i !== itemIndex)
+        };
+      }
+      return inv;
+    }).filter(inv => inv.items.length > 0));
+    
+    setDeleteConfirmation(null);
+  };
+
+  const copyToClipboard = (text: string, id: string) => {
+    navigator.clipboard.writeText(text);
+    setCopiedId(id);
+    setTimeout(() => setCopiedId(null), 2000);
+  };
+
+  const copyCellText = (text: string, cellId: string) => {
+    navigator.clipboard.writeText(text);
+    setCopiedCellId(cellId);
+    setTimeout(() => setCopiedCellId(null), 1500);
+  };
+
+  const handleHeaderContextMenu = (e: React.MouseEvent, field: SortField) => {
+    e.preventDefault();
+    setContextMenu({ x: e.clientX, y: e.clientY, field });
+  };
+
+  const closeContextMenu = useCallback(() => {
+    setContextMenu(null);
+    setUploadContextMenu(null);
+  }, []);
+
+  useEffect(() => {
+    window.addEventListener("click", closeContextMenu);
+    return () => window.removeEventListener("click", closeContextMenu);
+  }, [closeContextMenu]);
+
+  const handleSort = (field: SortField, order: SortOrder) => {
+    setSortField(field);
+    setSortOrder(order);
+    closeContextMenu();
+  };
+
+  const toggleColumnSearch = (e: React.MouseEvent, field: SortField) => {
+    e.stopPropagation();
+    setActiveSearchField(activeSearchField === field ? null : field);
+  };
+
+  return (
+    <div className="min-h-screen bg-[#020617] text-slate-100 font-sans p-4 md:p-8">
+      <div className="max-w-7xl mx-auto space-y-6">
+        {/* Header */}
+        <header className="flex justify-between items-center">
+          <div>
+            <h1 className="text-2xl font-black tracking-tighter text-white uppercase italic flex items-center gap-2">
+              <Receipt className="h-6 w-6 text-cyan-400" />
+              Facturas AI
+            </h1>
+            <p className="text-slate-500 text-[11px] font-bold uppercase tracking-widest mt-1">Costo final por producto • Cuadrado automático</p>
+          </div>
+          <div className="hidden md:block text-right">
+            <div className="text-[10px] text-slate-600 font-bold uppercase">Dashboard Comercial</div>
+            <div className="text-xs text-slate-400 font-medium">v1.2.0-stable</div>
+          </div>
+        </header>
+
+        <div className="grid gap-6 lg:grid-cols-[340px_1fr]">
+          {/* Left Column */}
+          <aside className="space-y-4">
+            {/* Upload Area */}
+            <div 
+              className="group flex flex-col items-center justify-center rounded-2xl border-2 border-dashed border-slate-800 bg-slate-900/20 p-8 min-h-[200px] transition-all hover:border-cyan-500/30 hover:bg-slate-900/40 cursor-pointer text-center relative overflow-hidden"
+              onClick={() => document.getElementById('file-upload')?.click()}
+              onContextMenu={handleUploadContextMenu}
+            >
+              <div className="absolute inset-0 bg-gradient-to-b from-cyan-500/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
+              <input 
+                id="file-upload" 
+                type="file" 
+                className="hidden" 
+                onChange={(e) => handleFileUpload(e.target.files)}
+                accept="image/*,.pdf,.xml,text/xml,application/xml"
+              />
+              <div className="bg-slate-800 p-4 rounded-full mb-4 group-hover:scale-110 transition-transform">
+                <Upload className="h-6 w-6 text-cyan-400" />
+              </div>
+              <p className="font-black text-slate-200 text-sm uppercase tracking-wide">Subir comprobantes</p>
+              <p className="text-[10px] text-slate-500 mt-1 uppercase font-bold tracking-tight">
+                Fotos, capturas, PDF o <span className="text-cyan-500 underline decoration-cyan-500/30 underline-offset-2">Pega una imagen (Ctrl+V o Click derecho)</span>
+              </p>
+              
+              {selectedFile && (
+                <div className="mt-6 flex items-center gap-2 rounded-lg bg-cyan-500/10 px-3 py-2 text-[10px] text-cyan-400 font-black border border-cyan-500/20 shadow-[0_0_15px_rgba(34,211,238,0.1)]">
+                  <FileText className="h-3.5 w-3.5" />
+                  <span className="truncate max-w-[150px]">{selectedFile.name}</span>
+                </div>
+              )}
+            </div>
+
+            {/* Progress Area */}
+            <AnimatePresence>
+              {isLoading && (
+                <motion.div 
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: "auto" }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="space-y-2 mb-4 overflow-hidden"
+                >
+                  <div className="flex justify-between items-end">
+                    <span className="text-[9px] font-black uppercase tracking-widest text-cyan-400 animate-pulse">
+                      {loadingPhase}
+                    </span>
+                    <span className="text-[9px] font-mono text-slate-500">
+                      {progress}%
+                    </span>
+                  </div>
+                  <div className="h-1 w-full bg-slate-900 rounded-full overflow-hidden border border-slate-800/50 relative">
+                    <motion.div 
+                      className="absolute inset-y-0 left-0 bg-linear-to-r from-cyan-600 to-cyan-400"
+                      initial={{ width: "0%" }}
+                      animate={{ width: `${progress}%` }}
+                      transition={{ type: "spring", bounce: 0, duration: 0.5 }}
+                    />
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            {/* Actions */}
+            <div className="grid grid-cols-2 gap-3">
+              <button 
+                onClick={() => { 
+                  setSelectedFile(null); 
+                  setResults([]); 
+                  setSortField(null); 
+                  setSortOrder(null); 
+                  setSearchQuery("");
+                  setColumnSearch({});
+                  setActiveSearchField(null);
+                }}
+                className="rounded-xl border border-slate-800 bg-slate-950 py-3.5 text-[10px] font-black uppercase tracking-widest text-slate-500 hover:bg-slate-900 hover:text-slate-300 transition"
+              >
+                Limpiar
+              </button>
+              <button 
+                onClick={processFile}
+                disabled={!selectedFile || isLoading}
+                className="flex items-center justify-center rounded-xl bg-cyan-600 py-3.5 text-[10px] font-black uppercase tracking-widest text-white shadow-[0_0_20px_rgba(8,145,178,0.2)] hover:bg-cyan-500 transition disabled:opacity-30 disabled:grayscale transition-all overflow-hidden"
+              >
+                {isLoading ? (
+                  <span className="animate-pulse">Procesando...</span>
+                ) : (
+                  "Procesar"
+                )}
+              </button>
+            </div>
+
+            {/* Status Panel */}
+            <div className="rounded-2xl border border-slate-800/60 bg-slate-900/30 p-5 space-y-4">
+              <div className="flex gap-2">
+                <div className="px-3 py-1 rounded bg-green-500/10 border border-green-500/20 flex items-center gap-1.5">
+                  <div className="h-1 w-1 rounded-full bg-green-500" />
+                  <span className="text-[9px] font-black text-green-500 uppercase">OK: {results.filter(r => r.status === 'OK' && !r.id.startsWith('demo')).length || (results.some(r => r.id === 'demo-1') ? 1 : 0)}</span>
+                </div>
+                <div className="px-3 py-1 rounded bg-amber-500/10 border border-amber-500/20 flex items-center gap-1.5">
+                  <div className="h-1 w-1 rounded-full bg-amber-500" />
+                  <span className="text-[9px] font-black text-amber-500 uppercase">Rev: {results.filter(r => r.status === 'REVIEW').length}</span>
+                </div>
+                <div className="px-3 py-1 rounded bg-slate-800 border border-slate-700 flex items-center gap-1.5">
+                  <span className="text-[9px] font-black text-slate-400 uppercase">Files: {results.filter(r => !r.id.startsWith('demo')).length}</span>
+                </div>
+              </div>
+              
+              {error && (
+                <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg text-[10px] text-red-300 italic font-medium">
+                  {error}
+                </div>
+              )}
+            </div>
+          </aside>
+
+          {/* Table Container */}
+          <main className="rounded-2xl border border-slate-800 bg-slate-900/20 flex flex-col min-h-[500px] shadow-2xl relative overflow-hidden backdrop-blur-sm">
+            {/* Search and Export */}
+            <div className="flex items-center gap-3 p-4 border-b border-slate-800/40 bg-slate-900/20">
+              <div className="flex-1 relative">
+                <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-slate-600" />
+                <input 
+                  type="text" 
+                  placeholder="BUSCAR PRODUCTO O CÓDIGO..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="w-full bg-slate-950/60 border border-slate-800 rounded-xl pl-10 pr-4 py-2.5 text-xs font-bold uppercase tracking-tight outline-none focus:border-cyan-500/40 transition-all placeholder:text-slate-700"
+                />
+              </div>
+              <button 
+                onClick={exportCSV}
+                disabled={filteredRows.length === 0}
+                className="px-6 py-2.5 rounded-xl border border-slate-800 bg-slate-950 text-[10px] font-black text-slate-400 hover:bg-slate-800 hover:text-white transition disabled:opacity-30 uppercase tracking-widest"
+              >
+                Exportar
+              </button>
+            </div>
+
+            {/* Table */}
+            <div className="flex-1 overflow-auto custom-scrollbar">
+              <table className="w-full text-left text-[11px] border-collapse relative border-slate-800">
+                <thead className="sticky top-0 z-10 bg-slate-900 shadow-md">
+                  <tr className="border-b border-slate-700 text-slate-500 uppercase font-black tracking-[0.2em] text-[9px]">
+                    <th 
+                      className="px-6 py-4 cursor-default select-none group/h border-r border-slate-800/50"
+                      onContextMenu={(e) => handleHeaderContextMenu(e, "barcode")}
+                    >
+                      <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-1">
+                          Código
+                          {sortField === "barcode" && (sortOrder === "asc" ? <ChevronUp className="h-3 w-3 text-cyan-400" /> : <ChevronDown className="h-3 w-3 text-cyan-400" />)}
+                        </div>
+                        <Search 
+                          className={`h-3 w-3 cursor-pointer transition-opacity ${activeSearchField === 'barcode' || columnSearch.barcode ? 'opacity-100 text-cyan-400' : 'opacity-0 group-hover/h:opacity-40 hover:opacity-100'}`}
+                          onClick={(e) => toggleColumnSearch(e, "barcode")}
+                        />
+                      </div>
+                      <AnimatePresence>
+                        {activeSearchField === 'barcode' && (
+                          <motion.div 
+                            initial={{ height: 0, opacity: 0 }}
+                            animate={{ height: 'auto', opacity: 1 }}
+                            exit={{ height: 0, opacity: 0 }}
+                            className="mt-2"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <input 
+                              autoFocus
+                              type="text"
+                              className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-[10px] outline-none focus:border-cyan-500/40"
+                              placeholder="Filtrar..."
+                              value={columnSearch.barcode || ""}
+                              onChange={(e) => setColumnSearch(prev => ({ ...prev, barcode: e.target.value }))}
+                            />
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+                    </th>
+                    <th 
+                      className="px-6 py-4 cursor-default select-none group/h text-left border-r border-slate-800/50"
+                      onContextMenu={(e) => handleHeaderContextMenu(e, "product")}
+                    >
+                      <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-1">
+                          Producto
+                          {sortField === "product" && (sortOrder === "asc" ? <ChevronUp className="h-3 w-3 text-cyan-400" /> : <ChevronDown className="h-3 w-3 text-cyan-400" />)}
+                        </div>
+                        <Search 
+                          className={`h-3 w-3 cursor-pointer transition-opacity ${activeSearchField === 'product' || columnSearch.product ? 'opacity-100 text-cyan-400' : 'opacity-0 group-hover/h:opacity-40 hover:opacity-100'}`}
+                          onClick={(e) => toggleColumnSearch(e, "product")}
+                        />
+                      </div>
+                      <AnimatePresence>
+                        {activeSearchField === 'product' && (
+                          <motion.div 
+                            initial={{ height: 0, opacity: 0 }}
+                            animate={{ height: 'auto', opacity: 1 }}
+                            exit={{ height: 0, opacity: 0 }}
+                            className="mt-2"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <input 
+                              autoFocus
+                              type="text"
+                              className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-[10px] outline-none focus:border-cyan-500/40"
+                              placeholder="Filtrar..."
+                              value={columnSearch.product || ""}
+                              onChange={(e) => setColumnSearch(prev => ({ ...prev, product: e.target.value }))}
+                            />
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+                    </th>
+                    <th 
+                      className="px-6 py-4 text-right cursor-default select-none group/h border-r border-slate-800/50"
+                      onContextMenu={(e) => handleHeaderContextMenu(e, "quantity")}
+                    >
+                      <div className="flex items-center justify-end gap-2">
+                        <Search 
+                          className={`h-3 w-3 cursor-pointer transition-opacity ${activeSearchField === 'quantity' || columnSearch.quantity ? 'opacity-100 text-cyan-400' : 'opacity-0 group-hover/h:opacity-40 hover:opacity-100'}`}
+                          onClick={(e) => toggleColumnSearch(e, "quantity")}
+                        />
+                        <div className="flex items-center gap-1">
+                          Cant
+                          {sortField === "quantity" && (sortOrder === "asc" ? <ChevronUp className="h-3 w-3 text-cyan-400" /> : <ChevronDown className="h-3 w-3 text-cyan-400" />)}
+                        </div>
+                      </div>
+                      <AnimatePresence>
+                        {activeSearchField === 'quantity' && (
+                          <motion.div 
+                            initial={{ height: 0, opacity: 0 }}
+                            animate={{ height: 'auto', opacity: 1 }}
+                            exit={{ height: 0, opacity: 0 }}
+                            className="mt-2"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <input 
+                              autoFocus
+                              type="text"
+                              className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-[10px] outline-none focus:border-cyan-500/40 text-right"
+                              placeholder="0..."
+                              value={columnSearch.quantity || ""}
+                              onChange={(e) => setColumnSearch(prev => ({ ...prev, quantity: e.target.value }))}
+                            />
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+                    </th>
+                    <th 
+                      className="px-6 py-4 text-right cursor-default select-none group/h border-r border-slate-800/50"
+                      onContextMenu={(e) => handleHeaderContextMenu(e, "finalUnitCost")}
+                    >
+                      <div className="flex items-center justify-end gap-2">
+                        <Search 
+                          className={`h-3 w-3 cursor-pointer transition-opacity ${activeSearchField === 'finalUnitCost' || columnSearch.finalUnitCost ? 'opacity-100 text-cyan-400' : 'opacity-0 group-hover/h:opacity-40 hover:opacity-100'}`}
+                          onClick={(e) => toggleColumnSearch(e, "finalUnitCost")}
+                        />
+                        <div className="flex items-center gap-1">
+                          Unit
+                          {sortField === "finalUnitCost" && (sortOrder === "asc" ? <ChevronUp className="h-3 w-3 text-cyan-400" /> : <ChevronDown className="h-3 w-3 text-cyan-400" />)}
+                        </div>
+                      </div>
+                      <AnimatePresence>
+                        {activeSearchField === 'finalUnitCost' && (
+                          <motion.div 
+                            initial={{ height: 0, opacity: 0 }}
+                            animate={{ height: 'auto', opacity: 1 }}
+                            exit={{ height: 0, opacity: 0 }}
+                            className="mt-2"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <input 
+                              autoFocus
+                              type="text"
+                              className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-[10px] outline-none focus:border-cyan-500/40 text-right"
+                              placeholder="0.00..."
+                              value={columnSearch.finalUnitCost || ""}
+                              onChange={(e) => setColumnSearch(prev => ({ ...prev, finalUnitCost: e.target.value }))}
+                            />
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+                    </th>
+                    <th 
+                      className="px-6 py-4 text-right cursor-default select-none group/h border-r border-slate-800/50"
+                      onContextMenu={(e) => handleHeaderContextMenu(e, "finalTotalCost")}
+                    >
+                      <div className="flex items-center justify-end gap-2">
+                        <Search 
+                          className={`h-3 w-3 cursor-pointer transition-opacity ${activeSearchField === 'finalTotalCost' || columnSearch.finalTotalCost ? 'opacity-100 text-cyan-400' : 'opacity-0 group-hover/h:opacity-40 hover:opacity-100'}`}
+                          onClick={(e) => toggleColumnSearch(e, "finalTotalCost")}
+                        />
+                        <div className="flex items-center gap-1">
+                          Total
+                          {sortField === "finalTotalCost" && (sortOrder === "asc" ? <ChevronUp className="h-3 w-3 text-cyan-400" /> : <ChevronDown className="h-3 w-3 text-cyan-400" />)}
+                        </div>
+                      </div>
+                      <AnimatePresence>
+                        {activeSearchField === 'finalTotalCost' && (
+                          <motion.div 
+                            initial={{ height: 0, opacity: 0 }}
+                            animate={{ height: 'auto', opacity: 1 }}
+                            exit={{ height: 0, opacity: 0 }}
+                            className="mt-2"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <input 
+                              autoFocus
+                              type="text"
+                              className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1 text-[10px] outline-none focus:border-cyan-500/40 text-right"
+                              placeholder="0.00..."
+                              value={columnSearch.finalTotalCost || ""}
+                              onChange={(e) => setColumnSearch(prev => ({ ...prev, finalTotalCost: e.target.value }))}
+                            />
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+                    </th>
+                    <th className="px-6 py-4 text-center text-slate-700 uppercase font-black tracking-widest text-[8px]">
+                      Acciones
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-700/60 text-slate-400">
+                  {filteredRows.map((row, idx) => (
+                    <tr key={idx} className="hover:bg-cyan-500/5 transition-all group border-b border-slate-800">
+                      <td 
+                        className={`px-6 py-3 font-mono text-[10px] italic border-r border-slate-800/50 cursor-pointer hover:bg-white/5 transition-colors relative ${copiedCellId === `${row.rowId}-barcode` ? 'text-cyan-400' : 'text-slate-500 group-hover:text-slate-400'}`}
+                        onClick={() => copyCellText(row.barcode || "", `${row.rowId}-barcode`)}
+                        title="Clic para copiar"
+                      >
+                        {row.barcode || "—"}
+                        {copiedCellId === `${row.rowId}-barcode` && (
+                          <motion.span initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="absolute right-1 top-1">
+                            <Check className="h-2 w-2" />
+                          </motion.span>
+                        )}
+                      </td>
+                      <td 
+                        className={`px-6 py-3 font-black uppercase tracking-tight border-r border-slate-800/50 cursor-pointer hover:bg-white/5 transition-colors relative ${copiedCellId === `${row.rowId}-product` ? 'text-cyan-400' : 'text-slate-200 group-hover:text-white'}`}
+                        onClick={() => copyCellText(row.product, `${row.rowId}-product`)}
+                        title="Clic para copiar"
+                      >
+                        <div className="flex items-center gap-2">
+                          {row.product}
+                          {row.taxCategory === "IVA_15" && (
+                            <span className="text-[7px] bg-cyan-500/20 text-cyan-400 px-1 rounded-sm border border-cyan-500/30">IVA</span>
+                          )}
+                        </div>
+                        {copiedCellId === `${row.rowId}-product` && (
+                          <motion.span initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="absolute right-1 top-1">
+                            <Check className="h-2 w-2" />
+                          </motion.span>
+                        )}
+                      </td>
+                      <td 
+                        className={`px-6 py-3 text-right font-bold tabular-nums border-r border-slate-800/50 cursor-pointer hover:bg-white/5 transition-colors relative ${copiedCellId === `${row.rowId}-qty` ? 'text-cyan-400' : 'text-slate-400'}`}
+                        onClick={() => copyCellText(row.quantity.toString(), `${row.rowId}-qty`)}
+                        title="Clic para copiar"
+                      >
+                        {row.quantity}
+                        {copiedCellId === `${row.rowId}-qty` && (
+                          <motion.span initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="absolute right-1 top-1">
+                            <Check className="h-2 w-2" />
+                          </motion.span>
+                        )}
+                      </td>
+                      <td 
+                        className={`px-6 py-3 text-right font-black tabular-nums text-xs brightness-125 border-r border-slate-800/50 cursor-pointer hover:bg-white/5 transition-colors relative ${copiedCellId === `${row.rowId}-unit` ? 'text-cyan-400' : 'text-cyan-400/90'}`}
+                        onClick={() => copyCellText(row.finalUnitCost.toFixed(4), `${row.rowId}-unit`)}
+                        title="Clic para copiar"
+                      >
+                        <span className="bg-cyan-950/20 px-1.5 py-0.5 rounded border border-cyan-500/10">
+                          ${row.finalUnitCost.toFixed(4)}
+                        </span>
+                        {copiedCellId === `${row.rowId}-unit` && (
+                          <motion.span initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="absolute right-1 top-1">
+                            <Check className="h-2 w-2" />
+                          </motion.span>
+                        )}
+                      </td>
+                      <td 
+                        className={`px-6 py-3 text-right font-black tabular-nums text-sm tracking-tighter border-r border-slate-800/50 cursor-pointer hover:bg-white/5 transition-colors relative ${copiedCellId === `${row.rowId}-total` ? 'text-cyan-400' : 'text-slate-100'}`}
+                        onClick={() => copyCellText(row.finalTotalCost.toFixed(2), `${row.rowId}-total`)}
+                        title="Clic para copiar"
+                      >
+                        ${row.finalTotalCost.toFixed(2)}
+                        {copiedCellId === `${row.rowId}-total` && (
+                          <motion.span initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="absolute right-1 top-1">
+                            <Check className="h-2 w-2" />
+                          </motion.span>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 text-right">
+                        <div className="flex items-center justify-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                          <button 
+                            onClick={() => copyToClipboard(`${row.product} | ${row.barcode}`, row.rowId)}
+                            className="p-1.5 rounded hover:bg-slate-800 text-slate-500 hover:text-cyan-400 transition-colors"
+                            title="Copiar detalles"
+                          >
+                            {copiedId === row.rowId ? <Check className="h-3.5 w-3.5 text-green-500" /> : <Copy className="h-3.5 w-3.5" />}
+                          </button>
+                          <button 
+                            onClick={() => deleteItem(row.invoiceId, row.itemIndex, row.product)}
+                            className="p-1.5 rounded hover:bg-red-500/10 text-slate-500 hover:text-red-500 transition-colors"
+                            title="Eliminar ítem"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                  
+                  {/* Spreadsheet Footer / Summary Row */}
+                  {filteredRows.length > 0 && (
+                    <tr className="bg-slate-950/80 border-t-2 border-slate-700 font-black text-[10px] sticky bottom-0 z-10 backdrop-blur-md">
+                      <td className="px-6 py-4 text-slate-600 uppercase tracking-widest border-r border-slate-800/50 italic">
+                        {filteredRows.length} Ítems Det.
+                      </td>
+                      <td className="px-6 py-4 uppercase tracking-tighter text-slate-600 border-r border-slate-800/50">
+                        Resultados de Columnas
+                      </td>
+                      <td className="px-6 py-4 text-right text-slate-300 border-r border-slate-800/50 tabular-nums">
+                        {filteredRows.reduce((a, b) => a + b.quantity, 0)}
+                      </td>
+                      <td className="px-6 py-4 text-right text-cyan-500/60 border-r border-slate-800/50 tabular-nums italic">
+                        AVG: ${(filteredRows.reduce((a, b) => a + b.finalUnitCost, 0) / filteredRows.length).toFixed(4)}
+                      </td>
+                      <td 
+                        className="px-6 py-4 text-right text-cyan-400 cursor-pointer bg-cyan-950/10 hover:bg-cyan-900/20 transition-colors border-r border-slate-800/50"
+                        onClick={(e) => { e.stopPropagation(); setIsAggMenuOpen(!isAggMenuOpen); }}
+                      >
+                        <div className="flex items-center justify-end gap-2">
+                          <Sigma className="h-3 w-3" />
+                          <span className="tabular-nums">${aggResult.toFixed(2)}</span>
+                        </div>
+                      </td>
+                      <td className="px-6 py-4"></td>
+                    </tr>
+                  )}
+
+                  {filteredRows.length === 0 && (
+                    <tr>
+                      <td colSpan={6} className="px-6 py-32 text-center text-slate-700 italic flex flex-col items-center gap-3">
+                        <Receipt className="h-8 w-8 opacity-20" />
+                        <span className="text-[10px] font-black uppercase tracking-widest opacity-40">No hay registros</span>
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Footer / Total */}
+            <div className="p-8 border-t border-slate-800/60 bg-slate-950/40 flex justify-between items-end backdrop-blur-xl relative">
+              <div>
+                <div className="text-cyan-500 font-black text-[10px] uppercase tracking-[0.3em] mb-1">Inventario AI</div>
+                <div className="text-slate-500 font-bold text-xs italic">
+                  {filteredRows.length} productos detectados
+                </div>
+              </div>
+              <div className="text-right">
+                <div className="relative group/agg">
+                  <button 
+                    onClick={(e) => { e.stopPropagation(); setIsAggMenuOpen(!isAggMenuOpen); }}
+                    className="flex items-center gap-1.5 ml-auto text-[9px] uppercase tracking-[0.3em] text-slate-600 font-black mb-2 opacity-80 hover:text-cyan-400 transition-colors cursor-pointer"
+                  >
+                    <Sigma className="h-3 w-3" />
+                    {aggLabel}
+                  </button>
+                  
+                  <AnimatePresence>
+                    {isAggMenuOpen && (
+                      <motion.div
+                        initial={{ opacity: 0, y: 5, scale: 0.95 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        exit={{ opacity: 0, y: 5, scale: 0.95 }}
+                        className="absolute bottom-full right-0 mb-2 w-56 bg-slate-900 border border-slate-800 rounded-lg shadow-2xl p-1 z-50 text-left"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <div className="px-3 py-2 border-b border-slate-800 mb-1">
+                          <span className="text-[9px] font-black uppercase tracking-widest text-slate-500 italic">Cálculo automático</span>
+                        </div>
+                        {[
+                          { id: "sum", label: "Suma" },
+                          { id: "count", label: "Número de elementos" },
+                          { id: "avg", label: "Promedio" },
+                          { id: "min", label: "Mínimo" },
+                          { id: "max", label: "Máximo" },
+                        ].map((opt) => (
+                          <button
+                            key={opt.id}
+                            onClick={() => { setAggType(opt.id as AggregationType); setIsAggMenuOpen(false); }}
+                            className={`w-full flex items-center justify-between px-3 py-2 text-xs font-bold rounded transition ${aggType === opt.id ? 'bg-cyan-500/10 text-cyan-400' : 'text-slate-300 hover:bg-slate-800 hover:text-white'}`}
+                          >
+                            {opt.label}
+                            {aggType === opt.id && <Check className="h-3 w-3" />}
+                          </button>
+                        ))}
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
+                <div className="text-6xl font-black text-white tabular-nums tracking-tighter glow-text leading-none">
+                  {aggType === 'sum' || aggType === 'avg' || aggType === 'min' || aggType === 'max' ? '$' : ''}
+                  {aggType === 'count' ? aggResult : aggResult.toFixed(2)}
+                </div>
+              </div>
+            </div>
+          </main>
+        </div>
+      </div>
+
+      <AnimatePresence>
+        {contextMenu && (
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95, y: -5 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.95, y: -5 }}
+            className="fixed z-50 min-w-[160px] bg-slate-900 border border-slate-700/50 rounded-lg shadow-2xl p-1 overflow-hidden"
+            style={{ top: contextMenu.y, left: contextMenu.x }}
+          >
+            <div className="px-3 py-2 border-b border-slate-800 mb-1">
+              <span className="text-[9px] font-black uppercase tracking-widest text-slate-500">Filtrar: {contextMenu.field}</span>
+            </div>
+            <button 
+              onClick={() => handleSort(contextMenu.field, "asc")}
+              className="w-full flex items-center gap-3 px-3 py-2 text-xs font-bold text-slate-300 hover:bg-slate-800 hover:text-white rounded transition"
+            >
+              <ChevronUp className="h-3.5 w-3.5 text-cyan-400" />
+              Ordenar A-Z / Menor
+            </button>
+            <button 
+              onClick={() => handleSort(contextMenu.field, "desc")}
+              className="w-full flex items-center gap-3 px-3 py-2 text-xs font-bold text-slate-300 hover:bg-slate-800 hover:text-white rounded transition"
+            >
+              <ChevronDown className="h-3.5 w-3.5 text-cyan-400" />
+              Ordenar Z-A / Mayor
+            </button>
+            <div className="h-px bg-slate-800 my-1" />
+            <button 
+              onClick={() => { setSortField(null); setSortOrder(null); setColumnSearch({}); setActiveSearchField(null); closeContextMenu(); }}
+              className="w-full flex items-center gap-3 px-3 py-2 text-xs font-bold text-red-400 hover:bg-red-500/10 rounded transition"
+            >
+              <FilterX className="h-3.5 w-3.5" />
+              Limpiar filtros
+            </button>
+          </motion.div>
+        )}
+
+        {uploadContextMenu && (
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95, y: -5 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.95, y: -5 }}
+            className="fixed z-50 min-w-[160px] bg-slate-900 border border-slate-700/50 rounded-lg shadow-2xl p-1 overflow-hidden"
+            style={{ top: uploadContextMenu.y, left: uploadContextMenu.x }}
+          >
+            <button 
+              onClick={(e) => {
+                e.stopPropagation();
+                handlePasteFromClipboard();
+              }}
+              className="w-full flex items-center gap-3 px-3 py-2 text-xs font-bold text-slate-300 hover:bg-slate-800 hover:text-white rounded transition"
+            >
+              <Copy className="h-3.5 w-3.5 text-cyan-400" />
+              Pegar imagen
+            </button>
+          </motion.div>
+        )}
+
+        {deleteConfirmation && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 bg-slate-950/80 backdrop-blur-sm"
+              onClick={() => setDeleteConfirmation(null)}
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-sm bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden"
+            >
+              <div className="p-6 text-center">
+                <div className="mx-auto w-12 h-12 rounded-full bg-red-500/10 flex items-center justify-center mb-4">
+                  <Trash2 className="h-6 w-6 text-red-500" />
+                </div>
+                <h3 className="text-white font-black text-lg mb-2">¿Confirmar eliminación?</h3>
+                <p className="text-slate-400 text-sm mb-6">
+                  Estás a punto de eliminar <span className="text-slate-200 font-bold italic">"{deleteConfirmation.productName}"</span>. Esta acción no se puede deshacer.
+                </p>
+                <div className="flex gap-3">
+                  <button 
+                    onClick={() => setDeleteConfirmation(null)}
+                    className="flex-1 px-4 py-3 rounded-xl bg-slate-800 text-slate-300 text-xs font-black uppercase tracking-widest hover:bg-slate-700 transition"
+                  >
+                    Cancelar
+                  </button>
+                  <button 
+                    onClick={confirmDelete}
+                    className="flex-1 px-4 py-3 rounded-xl bg-red-600 text-white text-xs font-black uppercase tracking-widest hover:bg-red-500 transition shadow-[0_0_20px_rgba(239,68,68,0.2)]"
+                  >
+                    Eliminar
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      <style>{`
+        .glow-text {
+          text-shadow: 0 0 30px rgba(34, 211, 238, 0.4), 0 0 60px rgba(34, 211, 238, 0.1);
+        }
+        .custom-scrollbar::-webkit-scrollbar {
+          width: 6px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+          background: transparent;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+          background: #1e293b;
+          border-radius: 10px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+          background: #334155;
+        }
+      `}</style>
+    </div>
+  );
+}
+

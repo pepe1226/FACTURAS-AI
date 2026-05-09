@@ -1,0 +1,6 @@
+{
+  "name": "Facturas AI Ecuador",
+  "description": "Extractor inteligente de datos para facturas, tickets y recibos de Ecuador. Calcula automáticamente el costo unitario real incluyendo IVA y descuentos.",
+  "requestFramePermissions": ["clipboard-read", "clipboard-write"],
+  "majorCapabilities": []
+}
