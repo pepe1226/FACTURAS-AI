@@ -1,5 +1,5 @@
-import { consultSriAuthorization } from "../../lib/sriAuthorization";
-import type { ApiRequest, ApiResponse } from "../../lib/types";
+import { consultSriAuthorization } from "../../lib/sriAuthorization.js";
+import type { ApiRequest, ApiResponse } from "../../lib/types.js";
 
 export const config = {
   api: {

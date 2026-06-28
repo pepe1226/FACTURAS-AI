@@ -1,4 +1,4 @@
-import { extractInvoice } from "./extractInvoice";
+import { extractInvoice } from "./extractInvoice.js";
 
 type SriEnvironment = "production" | "test";
 

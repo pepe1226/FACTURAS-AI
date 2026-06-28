@@ -1,5 +1,5 @@
-import { deleteInvoiceItem } from "../../../../lib/store";
-import type { ApiRequest, ApiResponse } from "../../../../lib/types";
+import { deleteInvoiceItem } from "../../../../lib/store.js";
+import type { ApiRequest, ApiResponse } from "../../../../lib/types.js";
 
 function firstQueryValue(value: string | string[] | undefined) {
   return Array.isArray(value) ? value[0] : value;

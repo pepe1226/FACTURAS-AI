@@ -1,5 +1,5 @@
-import { extractInvoice } from "../lib/extractInvoice";
-import type { ApiRequest, ApiResponse } from "../lib/types";
+import { extractInvoice } from "../lib/extractInvoice.js";
+import type { ApiRequest, ApiResponse } from "../lib/types.js";
 
 export const config = {
   api: {

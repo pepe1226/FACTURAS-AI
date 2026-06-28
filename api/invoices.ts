@@ -1,5 +1,5 @@
-import { readInvoices, upsertInvoice, writeInvoices } from "../lib/store";
-import type { ApiRequest, ApiResponse, InvoiceResult } from "../lib/types";
+import { readInvoices, upsertInvoice, writeInvoices } from "../lib/store.js";
+import type { ApiRequest, ApiResponse, InvoiceResult } from "../lib/types.js";
 
 export const config = {
   api: {

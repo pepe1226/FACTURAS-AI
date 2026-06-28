@@ -1,5 +1,5 @@
 import { Redis } from "@upstash/redis";
-import type { InvoiceResult } from "./types";
+import type { InvoiceResult } from "./types.js";
 
 const invoicesKey = "facturas-ai:invoices";
 
