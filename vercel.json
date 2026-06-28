@@ -1,0 +1,10 @@
+{
+  "functions": {
+    "api/extract-invoice.ts": {
+      "maxDuration": 60
+    },
+    "api/sri/authorization.ts": {
+      "maxDuration": 60
+    }
+  }
+}

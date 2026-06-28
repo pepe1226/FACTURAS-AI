@@ -4,7 +4,6 @@
  */
 
 import React, { useMemo, useRef, useState, useEffect, useCallback } from "react";
-import { GoogleGenAI, Type, GenerateContentResponse } from "@google/genai";
 import { 
   Upload, 
   FileText, 
@@ -33,6 +32,8 @@ import { motion, AnimatePresence } from "motion/react";
 
 type TaxCategory = "IVA_15" | "IVA_0" | "UNKNOWN";
 type InvoiceStatus = "OK" | "REVIEW";
+type InvoiceSource = "AI_UPLOAD" | "SRI_RECEIVED";
+type SriReceptionStatus = "Pendiente mapeo" | "Listo para ingresar" | "Ingresado";
 
 interface InvoiceItem {
   barcode: string;
@@ -47,9 +48,14 @@ interface InvoiceItem {
 interface InvoiceResult {
   id: string;
   fileName: string;
+  source?: InvoiceSource;
   supplier?: string;
+  supplierRuc?: string;
   invoiceNumber?: string;
   invoiceDate?: string;
+  accessKey?: string;
+  authorizationDate?: string;
+  sriReceptionStatus?: SriReceptionStatus;
   invoiceTotalPaid: number;
   currency: "USD";
   items: InvoiceItem[];
@@ -94,30 +100,47 @@ function sumItems(items: InvoiceItem[]): number {
   return roundMoney(items.reduce((acc, item) => acc + Number(item.finalTotalCost || 0), 0));
 }
 
-function normalizeItemsToInvoiceTotal(items: InvoiceItem[], invoiceTotalPaid: number): InvoiceItem[] {
-  const currentSum = sumItems(items);
-  const target = roundMoney(invoiceTotalPaid);
-  const diff = roundMoney(target - currentSum);
+function asFiniteNumber(value: unknown, fallback = 0): number {
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) ? numericValue : fallback;
+}
 
-  if (Math.abs(diff) <= 0.001 || items.length === 0) return items;
+function normalizeTaxCategory(value: unknown): TaxCategory {
+  return value === "IVA_15" || value === "IVA_0" || value === "UNKNOWN" ? value : "UNKNOWN";
+}
 
-  // Distribute difference to the most expensive item to minimize percentage impact
-  const maxIndex = items.reduce((best, item, index, array) => {
-    return Number(item.finalTotalCost || 0) > Number(array[best].finalTotalCost || 0) ? index : best;
-  }, 0);
+function sanitizeItems(items: unknown): InvoiceItem[] {
+  if (!Array.isArray(items)) return [];
 
-  return items.map((item, index) => {
-    if (index !== maxIndex) return item;
+  return items
+    .map((item): InvoiceItem | null => {
+      if (!item || typeof item !== "object") return null;
+      const source = item as Partial<InvoiceItem>;
+      const product = String(source.product || "").trim();
+      const quantity = Math.max(asFiniteNumber(source.quantity, 1), 1);
+      const finalTotalCost = roundMoney(asFiniteNumber(source.finalTotalCost));
+      const finalUnitCost = roundMoney(
+        Number.isFinite(Number(source.finalUnitCost))
+          ? asFiniteNumber(source.finalUnitCost)
+          : finalTotalCost / quantity,
+      );
 
-    const newTotal = roundMoney(Number(item.finalTotalCost || 0) + diff);
-    const safeQuantity = Math.max(Number(item.quantity || 1), 1);
+      if (!product || finalTotalCost < 0) return null;
 
-    return {
-      ...item,
-      finalTotalCost: newTotal,
-      finalUnitCost: roundMoney(newTotal / safeQuantity),
-    };
-  });
+      return {
+        barcode: String(source.barcode || "").trim(),
+        product,
+        quantity,
+        finalUnitCost,
+        finalTotalCost,
+        taxCategory: normalizeTaxCategory(source.taxCategory),
+      };
+    })
+    .filter((item): item is InvoiceItem => item !== null);
+}
+
+function sriReceptionStatus(items: InvoiceItem[], difference: number): SriReceptionStatus {
+  return items.length > 0 && Math.abs(difference) <= 0.01 ? "Listo para ingresar" : "Pendiente mapeo";
 }
 
 function fileToBase64(file: File): Promise<string> {
@@ -172,20 +195,15 @@ async function optimizeImage(base64: string, maxDimension = 2048): Promise<strin
 // =====================================================
 
 export default function App() {
-  const [results, setResults] = useState<InvoiceResult[]>(() => {
-    try {
-      const saved = localStorage.getItem("facturas_ai_results");
-      return saved ? JSON.parse(saved) : [];
-    } catch {
-      return [];
-    }
-  });
+  const [results, setResults] = useState<InvoiceResult[]>([]);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [progress, setProgress] = useState(0);
   const [loadingPhase, setLoadingPhase] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [sriAccessKey, setSriAccessKey] = useState("");
+  const [isSriSyncing, setIsSriSyncing] = useState(false);
   
   // Sorting & Filtering
   const [sortField, setSortField] = useState<SortField | null>(null);
@@ -200,8 +218,20 @@ export default function App() {
   const [deleteConfirmation, setDeleteConfirmation] = useState<{ invoiceId: string, itemIndex: number, productName: string } | null>(null);
   
   const [uploadContextMenu, setUploadContextMenu] = useState<{ x: number, y: number } | null>(null);
-  
-  const ai = useMemo(() => new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" }), []);
+
+  const loadInvoices = useCallback(async () => {
+    try {
+      const response = await fetch("/api/invoices");
+      if (!response.ok) throw new Error("No se pudo cargar el historial compartido.");
+      setResults(await response.json());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "No se pudo cargar el historial compartido.");
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadInvoices();
+  }, [loadInvoices]);
 
   const handleUploadContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -248,36 +278,6 @@ export default function App() {
       closeUploadContextMenu();
     }
   };
-
-  // Demo data for initial view as seen in screenshot
-  useEffect(() => {
-    const hasVisited = localStorage.getItem("facturas_ai_visited");
-    if (!hasVisited && results.length === 0) {
-      setResults([{
-        id: "demo-1",
-        fileName: "comprobante_demo.jpg",
-        supplier: "Producto Demo",
-        invoiceNumber: "001-001",
-        invoiceDate: "2024-05-08",
-        invoiceTotalPaid: 7.45,
-        currency: "USD",
-        items: [
-          { barcode: "7861001200012", product: "Producto demo detectado A", quantity: 2, finalUnitCost: 1.25, finalTotalCost: 2.50, taxCategory: "IVA_15" },
-          { barcode: "7862103400098", product: "Producto demo detectado B", quantity: 1, finalUnitCost: 3.20, finalTotalCost: 3.20, taxCategory: "IVA_15" },
-          { barcode: "", product: "Producto demo sin código", quantity: 1, finalUnitCost: 1.75, finalTotalCost: 1.75, taxCategory: "IVA_0" },
-        ],
-        status: "OK",
-        difference: 0,
-        notes: ["Datos de ejemplo"],
-      }]);
-      localStorage.setItem("facturas_ai_visited", "true");
-    }
-  }, []);
-
-  // Save to localStorage
-  useEffect(() => {
-    localStorage.setItem("facturas_ai_results", JSON.stringify(results));
-  }, [results]);
 
   const handleFileUpload = (files: FileList | null) => {
     if (!files || files.length === 0) return;
@@ -337,89 +337,74 @@ export default function App() {
       setProgress(25);
       setLoadingPhase("Analizando con IA...");
       
-      const contentParts: any[] = [{ text: EXTRACTION_PROMPT }];
-      
-      if (isXml) {
-        const xmlText = await selectedFile.text();
-        contentParts.push({ text: `CONTENIDO XML FACTURA ELECTRÓNICA ECUADOR:\n\n${xmlText}` });
-      } else {
-        contentParts.push({
-          inlineData: {
-            mimeType: selectedFile.type || "image/jpeg",
-            data: base64,
-          },
-        });
-      }
-      
-      const response: GenerateContentResponse = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: contentParts,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              supplier: { type: Type.STRING },
-              invoiceNumber: { type: Type.STRING },
-              invoiceDate: { type: Type.STRING },
-              invoiceTotalPaid: { type: Type.NUMBER },
-              currency: { type: Type.STRING },
-              items: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    barcode: { type: Type.STRING },
-                    product: { type: Type.STRING },
-                    quantity: { type: Type.NUMBER },
-                    finalUnitCost: { type: Type.NUMBER },
-                    finalTotalCost: { type: Type.NUMBER },
-                    taxCategory: { type: Type.STRING, enum: ["IVA_15", "IVA_0", "UNKNOWN"] },
-                  },
-                  required: ["product", "quantity", "finalTotalCost"]
-                }
-              },
-              notes: { type: Type.ARRAY, items: { type: Type.STRING } }
-            },
-            required: ["invoiceTotalPaid", "items"]
-          },
-        }
+      const response = await fetch("/api/extract-invoice", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fileName: selectedFile.name,
+          mimeType: selectedFile.type || (isXml ? "application/xml" : "image/jpeg"),
+          data: isXml ? undefined : base64,
+          xmlText: isXml ? await selectedFile.text() : undefined,
+        }),
       });
+
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        throw new Error(payload?.error || "No se pudo analizar la factura.");
+      }
 
       setProgress(70);
       setLoadingPhase("Procesando respuesta...");
 
-      const rawData = JSON.parse(response.text || "{}");
+      const rawData = await response.json();
       
       setProgress(85);
-      setLoadingPhase("Calculando cuadrados...");
+      setLoadingPhase("Validando datos...");
 
-      const normalizedItems = normalizeItemsToInvoiceTotal(
-        rawData.items || [], 
-        rawData.invoiceTotalPaid || 0
-      );
-      
-      const totalItems = sumItems(normalizedItems);
-      const difference = roundMoney((rawData.invoiceTotalPaid || 0) - totalItems);
+      const sanitizedItems = sanitizeItems(rawData.items || []);
+      const invoiceTotalPaid = roundMoney(asFiniteNumber(rawData.invoiceTotalPaid));
+      const totalItems = sumItems(sanitizedItems);
+      const difference = roundMoney(invoiceTotalPaid - totalItems);
+      const notes = Array.isArray(rawData.notes) ? rawData.notes.map(String) : [];
 
+      if (Math.abs(difference) > 0.01) {
+        notes.push(`Diferencia por revisar: factura ${invoiceTotalPaid.toFixed(2)} vs items ${totalItems.toFixed(2)}.`);
+      }
       const newResult: InvoiceResult = {
         id: crypto.randomUUID(),
         fileName: selectedFile.name,
+        source: isXml ? "SRI_RECEIVED" : "AI_UPLOAD",
         supplier: rawData.supplier || "Desconocido",
+        supplierRuc: rawData.supplierRuc || "",
         invoiceNumber: rawData.invoiceNumber || "",
         invoiceDate: rawData.invoiceDate || "",
-        invoiceTotalPaid: rawData.invoiceTotalPaid || 0,
+        accessKey: rawData.accessKey || "",
+        authorizationDate: rawData.authorizationDate || "",
+        sriReceptionStatus: isXml ? sriReceptionStatus(sanitizedItems, difference) : undefined,
+        invoiceTotalPaid,
         currency: "USD",
-        items: normalizedItems,
-        status: Math.abs(difference) <= 0.01 ? "OK" : "REVIEW",
+        items: sanitizedItems,
+        status: sanitizedItems.length > 0 && Math.abs(difference) <= 0.01 ? "OK" : "REVIEW",
         difference,
-        notes: rawData.notes || [],
+        notes,
       };
 
       setProgress(95);
       setLoadingPhase("Finalizando...");
 
-      setResults(prev => [newResult, ...prev.filter(r => !r.id.startsWith('demo'))]);
+      const saveResponse = await fetch("/api/invoices", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(newResult),
+      });
+
+      if (!saveResponse.ok) {
+        const payload = await saveResponse.json().catch(() => null);
+        throw new Error(payload?.error || "La factura se extrajo, pero no se pudo guardar.");
+      }
+
+      const savedResult = await saveResponse.json();
+      setResults(prev => [savedResult, ...prev.filter(r => r.id !== savedResult.id)]);
       setSelectedFile(null);
       setProgress(100);
       
@@ -434,6 +419,83 @@ export default function App() {
       setIsLoading(false);
       setProgress(0);
       setLoadingPhase("");
+    }
+  };
+
+  const consultSriByAccessKey = async () => {
+    const cleanAccessKey = sriAccessKey.replace(/\D/g, "");
+    if (cleanAccessKey.length !== 49) {
+      setError("La clave de acceso SRI debe tener 49 digitos.");
+      return;
+    }
+
+    setIsSriSyncing(true);
+    setError(null);
+
+    try {
+      const response = await fetch("/api/sri/authorization", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ accessKey: cleanAccessKey, environment: "production" }),
+      });
+
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        throw new Error(payload?.error || "No se pudo consultar el SRI.");
+      }
+
+      const rawData = await response.json();
+      if (rawData.sriAuthorizationStatus && rawData.sriAuthorizationStatus !== "AUTORIZADO") {
+        throw new Error(`SRI: ${rawData.sriAuthorizationStatus}. ${(rawData.notes || []).join(" ")}`);
+      }
+
+      const sanitizedItems = sanitizeItems(rawData.items || []);
+      const invoiceTotalPaid = roundMoney(asFiniteNumber(rawData.invoiceTotalPaid));
+      const totalItems = sumItems(sanitizedItems);
+      const difference = roundMoney(invoiceTotalPaid - totalItems);
+      const notes = Array.isArray(rawData.notes) ? rawData.notes.map(String) : [];
+
+      if (Math.abs(difference) > 0.01) {
+        notes.push(`Diferencia por revisar: factura ${invoiceTotalPaid.toFixed(2)} vs items ${totalItems.toFixed(2)}.`);
+      }
+
+      const newResult: InvoiceResult = {
+        id: crypto.randomUUID(),
+        fileName: `${cleanAccessKey}.xml`,
+        source: "SRI_RECEIVED",
+        supplier: rawData.supplier || "Desconocido",
+        supplierRuc: rawData.supplierRuc || "",
+        invoiceNumber: rawData.invoiceNumber || "",
+        invoiceDate: rawData.invoiceDate || "",
+        accessKey: cleanAccessKey,
+        authorizationDate: rawData.authorizationDate || "",
+        sriReceptionStatus: sriReceptionStatus(sanitizedItems, difference),
+        invoiceTotalPaid,
+        currency: "USD",
+        items: sanitizedItems,
+        status: sanitizedItems.length > 0 && Math.abs(difference) <= 0.01 ? "OK" : "REVIEW",
+        difference,
+        notes,
+      };
+
+      const saveResponse = await fetch("/api/invoices", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(newResult),
+      });
+
+      if (!saveResponse.ok) {
+        const payload = await saveResponse.json().catch(() => null);
+        throw new Error(payload?.error || "La factura se consulto, pero no se pudo guardar.");
+      }
+
+      const savedResult = await saveResponse.json();
+      setResults((prev) => [savedResult, ...prev.filter((invoice) => invoice.id !== savedResult.id)]);
+      setSriAccessKey("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "No se pudo consultar el SRI.");
+    } finally {
+      setIsSriSyncing(false);
     }
   };
 
@@ -527,13 +589,29 @@ export default function App() {
     }
   }, [aggType]);
 
+  const sriInvoices = useMemo(
+    () => results.filter((invoice) => invoice.source === "SRI_RECEIVED" || invoice.fileName.toLowerCase().endsWith(".xml")),
+    [results],
+  );
+
+  const sriReady = sriInvoices.filter((invoice) => invoice.sriReceptionStatus === "Listo para ingresar").length;
+  const sriPending = sriInvoices.length - sriReady;
+  const sriTotal = roundMoney(sriInvoices.reduce((acc, invoice) => acc + invoice.invoiceTotalPaid, 0));
+  const sriUnmappedItems = sriInvoices.reduce(
+    (acc, invoice) => acc + invoice.items.filter((item) => !item.barcode).length,
+    0,
+  );
+
   const exportCSV = () => {
-    const headers = ["Fecha", "Proveedor", "Producto", "Código", "Cantidad", "Precio Unit", "Total", "IVA", "Archivo"];
+    const headers = ["Fecha", "Proveedor", "RUC", "Factura", "Clave acceso", "Producto", "Codigo", "Cantidad", "Precio Unit", "Total", "IVA", "Archivo"];
     const csvData = filteredRows.map(row => {
       const inv = results.find(r => r.id === row.invoiceId);
       const rowData = [
         inv?.invoiceDate || "",
         row.supplier || "",
+        inv?.supplierRuc || "",
+        inv?.invoiceNumber || "",
+        inv?.accessKey || "",
         row.product || "",
         row.barcode || "",
         row.quantity,
@@ -567,21 +645,44 @@ export default function App() {
     setDeleteConfirmation({ invoiceId, itemIndex, productName });
   };
 
-  const confirmDelete = () => {
+  const confirmDelete = async () => {
     if (!deleteConfirmation) return;
     const { invoiceId, itemIndex } = deleteConfirmation;
-    
-    setResults(prev => prev.map(inv => {
-      if (inv.id === invoiceId) {
-        return {
-          ...inv,
-          items: inv.items.filter((_, i) => i !== itemIndex)
-        };
+
+    try {
+      const response = await fetch(`/api/invoices/${invoiceId}/items/${itemIndex}`, {
+        method: "DELETE",
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        throw new Error(payload?.error || "No se pudo eliminar el item.");
       }
-      return inv;
-    }).filter(inv => inv.items.length > 0));
-    
-    setDeleteConfirmation(null);
+
+      setResults(await response.json());
+      setDeleteConfirmation(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "No se pudo eliminar el item.");
+    }
+  };
+
+  const clearResults = async () => {
+    try {
+      const response = await fetch("/api/invoices", { method: "DELETE" });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        throw new Error(payload?.error || "No se pudo limpiar el historial.");
+      }
+
+      setSelectedFile(null);
+      setResults([]);
+      setSortField(null);
+      setSortOrder(null);
+      setSearchQuery("");
+      setColumnSearch({});
+      setActiveSearchField(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "No se pudo limpiar el historial.");
+    }
   };
 
   const copyToClipboard = (text: string, id: string) => {
@@ -705,15 +806,7 @@ export default function App() {
             {/* Actions */}
             <div className="grid grid-cols-2 gap-3">
               <button 
-                onClick={() => { 
-                  setSelectedFile(null); 
-                  setResults([]); 
-                  setSortField(null); 
-                  setSortOrder(null); 
-                  setSearchQuery("");
-                  setColumnSearch({});
-                  setActiveSearchField(null);
-                }}
+                onClick={clearResults}
                 className="rounded-xl border border-slate-800 bg-slate-950 py-3.5 text-[10px] font-black uppercase tracking-widest text-slate-500 hover:bg-slate-900 hover:text-slate-300 transition"
               >
                 Limpiar
@@ -736,14 +829,14 @@ export default function App() {
               <div className="flex gap-2">
                 <div className="px-3 py-1 rounded bg-green-500/10 border border-green-500/20 flex items-center gap-1.5">
                   <div className="h-1 w-1 rounded-full bg-green-500" />
-                  <span className="text-[9px] font-black text-green-500 uppercase">OK: {results.filter(r => r.status === 'OK' && !r.id.startsWith('demo')).length || (results.some(r => r.id === 'demo-1') ? 1 : 0)}</span>
+                  <span className="text-[9px] font-black text-green-500 uppercase">OK: {results.filter(r => r.status === 'OK').length}</span>
                 </div>
                 <div className="px-3 py-1 rounded bg-amber-500/10 border border-amber-500/20 flex items-center gap-1.5">
                   <div className="h-1 w-1 rounded-full bg-amber-500" />
                   <span className="text-[9px] font-black text-amber-500 uppercase">Rev: {results.filter(r => r.status === 'REVIEW').length}</span>
                 </div>
                 <div className="px-3 py-1 rounded bg-slate-800 border border-slate-700 flex items-center gap-1.5">
-                  <span className="text-[9px] font-black text-slate-400 uppercase">Files: {results.filter(r => !r.id.startsWith('demo')).length}</span>
+                  <span className="text-[9px] font-black text-slate-400 uppercase">Files: {results.length}</span>
                 </div>
               </div>
               
@@ -757,6 +850,100 @@ export default function App() {
 
           {/* Table Container */}
           <main className="rounded-2xl border border-slate-800 bg-slate-900/20 flex flex-col min-h-[500px] shadow-2xl relative overflow-hidden backdrop-blur-sm">
+            <section className="border-b border-slate-800/60 bg-slate-950/30 p-4 space-y-4">
+              <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                <div>
+                  <div className="text-[10px] font-black uppercase tracking-[0.3em] text-cyan-500">Recepcion SRI</div>
+                  <h2 className="text-lg font-black uppercase tracking-tight text-white">Facturas recibidas</h2>
+                </div>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[10px] font-black uppercase">
+                  <div className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-2">
+                    <span className="block text-slate-600">XML</span>
+                    <strong className="text-slate-200">{sriInvoices.length}</strong>
+                  </div>
+                  <div className="rounded-lg border border-green-500/20 bg-green-500/10 px-3 py-2">
+                    <span className="block text-green-600">Listas</span>
+                    <strong className="text-green-400">{sriReady}</strong>
+                  </div>
+                  <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2">
+                    <span className="block text-amber-600">Mapeo</span>
+                    <strong className="text-amber-400">{sriPending}</strong>
+                  </div>
+                  <div className="rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-3 py-2">
+                    <span className="block text-cyan-600">Total</span>
+                    <strong className="text-cyan-400">${sriTotal.toFixed(2)}</strong>
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid gap-2 md:grid-cols-4">
+                {["Consultar SRI", "Validar XML", "Mapear productos", "Ingresar compra"].map((step, index) => (
+                  <div key={step} className="flex items-center gap-2 rounded-lg border border-slate-800 bg-slate-900/50 px-3 py-2">
+                    <div className={`flex h-6 w-6 items-center justify-center rounded-full text-[10px] font-black ${index < 2 ? "bg-cyan-500/20 text-cyan-400" : "bg-slate-800 text-slate-500"}`}>
+                      {index + 1}
+                    </div>
+                    <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">{step}</span>
+                  </div>
+                ))}
+              </div>
+
+              <div className="grid gap-2 md:grid-cols-[1fr_auto]">
+                <input
+                  value={sriAccessKey}
+                  onChange={(event) => setSriAccessKey(event.target.value)}
+                  inputMode="numeric"
+                  maxLength={60}
+                  placeholder="CLAVE DE ACCESO SRI (49 DIGITOS)"
+                  className="rounded-xl border border-slate-800 bg-slate-950/70 px-4 py-3 font-mono text-[11px] font-bold tracking-wider text-slate-200 outline-none transition focus:border-cyan-500/40 placeholder:text-slate-700"
+                />
+                <button
+                  onClick={consultSriByAccessKey}
+                  disabled={isSriSyncing}
+                  className="rounded-xl bg-cyan-600 px-5 py-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-cyan-500 disabled:opacity-40"
+                >
+                  {isSriSyncing ? "Consultando..." : "Consultar SRI"}
+                </button>
+              </div>
+
+              <div className="rounded-xl border border-slate-800 overflow-hidden">
+                <div className="grid grid-cols-[1.2fr_1fr_0.8fr_0.8fr] gap-2 bg-slate-950 px-4 py-2 text-[9px] font-black uppercase tracking-widest text-slate-600">
+                  <span>Proveedor</span>
+                  <span>Clave acceso</span>
+                  <span>Estado</span>
+                  <span className="text-right">Total</span>
+                </div>
+                <div className="max-h-52 overflow-auto custom-scrollbar divide-y divide-slate-800">
+                  {sriInvoices.length === 0 ? (
+                    <div className="px-4 py-8 text-center text-[10px] font-black uppercase tracking-widest text-slate-700">
+                      Sube XML autorizados del SRI para alimentar este modulo
+                    </div>
+                  ) : (
+                    sriInvoices.slice(0, 6).map((invoice) => (
+                      <div key={invoice.id} className="grid grid-cols-[1.2fr_1fr_0.8fr_0.8fr] gap-2 px-4 py-3 text-[11px]">
+                        <div>
+                          <strong className="block text-slate-200 uppercase">{invoice.supplier || "Proveedor"}</strong>
+                          <span className="text-slate-600">{invoice.supplierRuc || invoice.invoiceNumber || "Sin RUC"}</span>
+                        </div>
+                        <span className="truncate font-mono text-[9px] text-slate-500" title={invoice.accessKey || ""}>
+                          {invoice.accessKey || "Pendiente"}
+                        </span>
+                        <span className={`w-fit rounded-full px-2 py-1 text-[9px] font-black uppercase ${invoice.sriReceptionStatus === "Listo para ingresar" ? "bg-green-500/10 text-green-400" : "bg-amber-500/10 text-amber-400"}`}>
+                          {invoice.sriReceptionStatus || "Pendiente mapeo"}
+                        </span>
+                        <strong className="text-right text-cyan-400">${invoice.invoiceTotalPaid.toFixed(2)}</strong>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+
+              {sriUnmappedItems > 0 && (
+                <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-[10px] font-bold text-amber-300">
+                  {sriUnmappedItems} productos recibidos no tienen codigo de barras y requieren mapeo antes de ingresar inventario.
+                </div>
+              )}
+            </section>
+
             {/* Search and Export */}
             <div className="flex items-center gap-3 p-4 border-b border-slate-800/40 bg-slate-900/20">
               <div className="flex-1 relative">

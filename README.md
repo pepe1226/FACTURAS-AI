@@ -1,20 +1,39 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# Facturas AI
 
-# Run and deploy your AI Studio app
+App Vite/React desplegable en Vercel para leer facturas con Gemini y compartir el historial entre diferentes PCs.
 
-This contains everything you need to run your app locally.
+## Vercel
 
-View your app in AI Studio: https://ai.studio/apps/3ee0a8f8-4a31-49eb-850b-e0dc62538414
+Configura estas variables en Vercel Project Settings > Environment Variables:
 
-## Run Locally
+- `GEMINI_API_KEY`
+- `UPSTASH_REDIS_REST_URL`
+- `UPSTASH_REDIS_REST_TOKEN`
+- `GEMINI_MODEL` opcional
 
-**Prerequisites:**  Node.js
+El historial compartido se guarda en Redis/Upstash desde las funciones serverless de `api/`. No se guarda en el navegador ni en archivos locales.
 
+## Recepcion SRI
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+El modulo SRI permite:
+
+- Subir XML autorizados del SRI.
+- Consultar un comprobante autorizado por clave de acceso de 49 digitos.
+- Guardar proveedor, RUC, clave de acceso, fecha de autorizacion, productos y estado de mapeo.
+
+La consulta usa el servicio oficial de autorizacion por clave de acceso. No automatiza el portal web del SRI ni intenta saltar captcha.
+
+## Desarrollo
+
+```bash
+npm install
+npm run dev
+```
+
+`npm run dev` usa `npx vercel dev` para probar las rutas serverless igual que en Vercel.
+
+## Build
+
+```bash
+npm run build
+```
