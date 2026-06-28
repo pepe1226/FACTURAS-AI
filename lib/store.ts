@@ -5,11 +5,22 @@ const invoicesKey = "facturas-ai:invoices";
 
 let redisClient: Redis | null = null;
 
+function redisConfig() {
+  return {
+    url: process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL,
+    token: process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN,
+  };
+}
+
+export function hasRedisConfigured() {
+  const { url, token } = redisConfig();
+  return Boolean(url && token);
+}
+
 function getRedis() {
   if (redisClient) return redisClient;
 
-  const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
+  const { url, token } = redisConfig();
 
   if (!url || !token) {
     throw new Error(
@@ -22,6 +33,8 @@ function getRedis() {
 }
 
 export async function readInvoices(): Promise<InvoiceResult[]> {
+  if (!hasRedisConfigured()) return [];
+
   const invoices = await getRedis().get<InvoiceResult[]>(invoicesKey);
   return Array.isArray(invoices) ? invoices : [];
 }

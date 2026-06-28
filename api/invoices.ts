@@ -1,4 +1,4 @@
-import { readInvoices, upsertInvoice, writeInvoices } from "../lib/store.js";
+import { hasRedisConfigured, readInvoices, upsertInvoice, writeInvoices } from "../lib/store.js";
 import type { ApiRequest, ApiResponse, InvoiceResult } from "../lib/types.js";
 
 export const config = {
@@ -28,6 +28,11 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
     }
 
     if (req.method === "POST") {
+      if (!hasRedisConfigured()) {
+        res.status(503).json({ error: "Configura Redis/Upstash en Vercel para guardar facturas compartidas." });
+        return;
+      }
+
       if (!isInvoice(req.body)) {
         res.status(400).json({ error: "Factura invalida." });
         return;
@@ -38,6 +43,11 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
     }
 
     if (req.method === "DELETE") {
+      if (!hasRedisConfigured()) {
+        res.status(503).json({ error: "Configura Redis/Upstash en Vercel para limpiar el historial compartido." });
+        return;
+      }
+
       await writeInvoices([]);
       res.status(204).end();
       return;

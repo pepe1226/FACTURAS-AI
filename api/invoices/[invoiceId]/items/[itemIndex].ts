@@ -1,4 +1,4 @@
-import { deleteInvoiceItem } from "../../../../lib/store.js";
+import { deleteInvoiceItem, hasRedisConfigured } from "../../../../lib/store.js";
 import type { ApiRequest, ApiResponse } from "../../../../lib/types.js";
 
 function firstQueryValue(value: string | string[] | undefined) {
@@ -12,6 +12,11 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
   }
 
   try {
+    if (!hasRedisConfigured()) {
+      res.status(503).json({ error: "Configura Redis/Upstash en Vercel para editar facturas compartidas." });
+      return;
+    }
+
     const invoiceId = firstQueryValue(req.query?.invoiceId);
     const itemIndex = Number(firstQueryValue(req.query?.itemIndex));
 
