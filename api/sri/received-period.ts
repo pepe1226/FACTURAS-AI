@@ -1,6 +1,5 @@
 import {
   importSriReceivedPeriod,
-  SriPortalAutomationRequiredError,
   validateSriPeriod,
 } from "../../lib/sriReceivedReports.js";
 import { readSriSession } from "../../lib/sriSession.js";
@@ -72,14 +71,6 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
       },
     });
   } catch (error) {
-    if (error instanceof SriPortalAutomationRequiredError) {
-      res.status(501).json({
-        error: error.message,
-        code: "SRI_PORTAL_CONNECTOR_REQUIRED",
-      });
-      return;
-    }
-
     const message = error instanceof Error ? error.message : "No se pudo importar reportes SRI.";
     res.status(500).json({ error: message });
   }
