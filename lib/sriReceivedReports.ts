@@ -98,6 +98,124 @@ function extractAccessKeys(html: string) {
   return Array.from(new Set(html.match(/\b\d{49}\b/g) || []));
 }
 
+function htmlAttr(tag: string, name: string) {
+  const match = tag.match(new RegExp(`${name}=["']([^"']*)["']`, "i"));
+  return match ? decodeHtml(match[1]) : "";
+}
+
+function normalizeName(value: string) {
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+function parseReceivedForm(html: string) {
+  const forms = [...html.matchAll(/<form\b[\s\S]*?<\/form>/gi)].map((match) => match[0]);
+  const formHtml =
+    forms.find((form) => /frm|principal|formulario|consulta/i.test(form) && /javax\.faces\.ViewState/i.test(form)) ||
+    forms.find((form) => /javax\.faces\.ViewState/i.test(form)) ||
+    forms[0] ||
+    "";
+  const formTag = formHtml.match(/<form\b[^>]*>/i)?.[0] || "";
+  const id = htmlAttr(formTag, "id") || htmlAttr(formTag, "name") || "frmPrincipal";
+  const action = htmlAttr(formTag, "action") || receivedPageUrl;
+  const params = new URLSearchParams();
+
+  for (const input of formHtml.matchAll(/<input\b[^>]*>/gi)) {
+    const tag = input[0];
+    const name = htmlAttr(tag, "name");
+    if (!name) continue;
+    const type = normalizeName(htmlAttr(tag, "type"));
+    if (["button", "submit", "image"].includes(type)) continue;
+    params.set(name, htmlAttr(tag, "value"));
+  }
+
+  for (const select of formHtml.matchAll(/<select\b[^>]*>[\s\S]*?<\/select>/gi)) {
+    const selectHtml = select[0];
+    const selectTag = selectHtml.match(/<select\b[^>]*>/i)?.[0] || "";
+    const name = htmlAttr(selectTag, "name");
+    if (!name) continue;
+    const selectedOption = [...selectHtml.matchAll(/<option\b[^>]*>[\s\S]*?<\/option>/gi)].find((option) =>
+      /\sselected\b/i.test(option[0]),
+    );
+    const firstOption = selectHtml.match(/<option\b[^>]*>[\s\S]*?<\/option>/i)?.[0] || "";
+    params.set(name, htmlAttr(selectedOption?.[0] || firstOption, "value"));
+  }
+
+  for (const textarea of formHtml.matchAll(/<textarea\b[^>]*>([\s\S]*?)<\/textarea>/gi)) {
+    const textareaTag = textarea[0].match(/<textarea\b[^>]*>/i)?.[0] || "";
+    const name = htmlAttr(textareaTag, "name");
+    if (name) params.set(name, decodeHtml(textarea[1] || ""));
+  }
+
+  return { id, action, html: formHtml, params };
+}
+
+function setMatchingField(params: URLSearchParams, candidates: string[], value: string) {
+  const normalizedCandidates = candidates.map(normalizeName);
+
+  for (const key of Array.from(params.keys())) {
+    const normalizedKey = normalizeName(key);
+    if (normalizedCandidates.some((candidate) => normalizedKey.includes(candidate))) {
+      params.set(key, value);
+    }
+  }
+}
+
+function firstSubmitControl(formHtml: string) {
+  const controls = [
+    ...formHtml.matchAll(/<button\b[^>]*>[\s\S]*?<\/button>/gi),
+    ...formHtml.matchAll(/<input\b[^>]*>/gi),
+  ].map((match) => match[0]);
+
+  return controls.find((control) => /consult|buscar|filtrar|aceptar/i.test(control)) || controls[0] || "";
+}
+
+async function submitReceivedPeriodFilter(html: string, jar: CookieJar, input: SriReceivedPeriodInput) {
+  const form = parseReceivedForm(html);
+  if (!form.html) {
+    throw new Error("El SRI inicio sesion, pero no devolvio el formulario de comprobantes recibidos.");
+  }
+
+  const params = new URLSearchParams(form.params);
+  params.set(form.id, form.id);
+  setMatchingField(params, ["anio", "ano", "year"], String(input.year));
+  setMatchingField(params, ["mes", "month"], String(input.month));
+  setMatchingField(params, ["dia", "day"], String(input.day));
+  setMatchingField(params, ["tipoComprobante", "tipo_comprobante", "comprobante", "cmbTipo"], input.voucherType);
+
+  const formPrefix = form.id.includes(":") ? form.id.split(":")[0] : form.id;
+  const guessedFields: Record<string, string> = {
+    [`${formPrefix}:ano`]: String(input.year),
+    [`${formPrefix}:anio`]: String(input.year),
+    [`${formPrefix}:mes`]: String(input.month),
+    [`${formPrefix}:dia`]: String(input.day),
+    [`${formPrefix}:cmbTipoComprobante`]: input.voucherType,
+    [`${formPrefix}:tipoComprobante`]: input.voucherType,
+  };
+
+  for (const [key, value] of Object.entries(guessedFields)) {
+    if (!params.has(key)) params.set(key, value);
+  }
+
+  const submitControl = firstSubmitControl(form.html);
+  const submitName = htmlAttr(submitControl, "name") || htmlAttr(submitControl, "id") || `${formPrefix}:btnConsultar`;
+  params.set(submitName, htmlAttr(submitControl, "value") || "Consultar");
+
+  const response = await followSriRedirects(new URL(form.action, receivedPageUrl).toString(), jar, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      origin: "https://srienlinea.sri.gob.ec",
+      referer: receivedPageUrl,
+    },
+    body: params,
+  });
+
+  return response.text();
+}
+
 function looksLikeLoginFailed(html: string) {
   return /usuario|clave|credenciales|inv[aá]lid|incorrect/i.test(html) && /kc-form-login|login-pf/i.test(html);
 }
@@ -173,7 +291,7 @@ async function openReceivedPage(input: SriReceivedPeriodInput) {
     throw new Error("El SRI no acepto las credenciales ingresadas.");
   }
 
-  return html;
+  return submitReceivedPeriodFilter(html, jar, input);
 }
 
 export async function importSriReceivedPeriod(
