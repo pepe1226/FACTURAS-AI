@@ -27,7 +27,8 @@ import {
   LogIn,
   LogOut,
   ShieldCheck,
-  RefreshCw
+  RefreshCw,
+  CalendarDays
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 
@@ -86,6 +87,8 @@ type SriBulkSummary = {
   imported: number;
   failed: number;
 };
+
+type SriVoucherType = "1" | "2" | "3" | "4" | "6";
 
 const DEFAULT_ECUADOR_VAT_RATE = 0.15;
 
@@ -226,10 +229,13 @@ export default function App() {
   const [sriUsername, setSriUsername] = useState("");
   const [sriPassword, setSriPassword] = useState("");
   const [sriSession, setSriSession] = useState<SriSessionState | null>(null);
-  const [sriBulkKeys, setSriBulkKeys] = useState("");
   const [sriBulkSummary, setSriBulkSummary] = useState<SriBulkSummary | null>(null);
   const [isSriLoggingIn, setIsSriLoggingIn] = useState(false);
-  const [isSriBulkReceiving, setIsSriBulkReceiving] = useState(false);
+  const [sriPeriodYear, setSriPeriodYear] = useState(String(new Date().getFullYear()));
+  const [sriPeriodMonth, setSriPeriodMonth] = useState(String(new Date().getMonth() + 1).padStart(2, "0"));
+  const [sriPeriodDay, setSriPeriodDay] = useState("0");
+  const [sriVoucherType, setSriVoucherType] = useState<SriVoucherType>("1");
+  const [isSriPeriodImporting, setIsSriPeriodImporting] = useState(false);
   
   // Sorting & Filtering
   const [sortField, setSortField] = useState<SortField | null>(null);
@@ -516,36 +522,33 @@ export default function App() {
     }).catch(() => null);
   };
 
-  const receiveSriBulk = async () => {
+  const importSriPeriod = async () => {
     if (!sriSession) {
-      setError("Inicia sesion SRI antes de recibir comprobantes.");
+      setError("Inicia sesion SRI antes de importar por periodo.");
       return;
     }
 
-    const accessKeys = sriBulkKeys.match(/\d{49}/g) || [];
-    if (accessKeys.length === 0) {
-      setError("Pega una o mas claves de acceso SRI de 49 digitos.");
-      return;
-    }
-
-    setIsSriBulkReceiving(true);
+    setIsSriPeriodImporting(true);
     setError(null);
     setSriBulkSummary(null);
 
     try {
-      const response = await fetch("/api/sri/bulk-receive", {
+      const response = await fetch("/api/sri/received-period", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           sessionId: sriSession.id,
-          accessKeys,
+          year: Number(sriPeriodYear),
+          month: Number(sriPeriodMonth),
+          day: Number(sriPeriodDay),
+          voucherType: sriVoucherType,
           environment: "production",
         }),
       });
 
       const payload = await response.json().catch(() => null);
       if (!response.ok) {
-        throw new Error(payload?.error || "No se pudo recibir comprobantes SRI.");
+        throw new Error(payload?.error || "No se pudo importar el periodo SRI.");
       }
 
       const imported = Array.isArray(payload.imported) ? payload.imported as InvoiceResult[] : [];
@@ -554,15 +557,10 @@ export default function App() {
         return [...imported, ...prev.filter((invoice) => !importedIds.has(invoice.id))];
       });
       setSriBulkSummary(payload.summary || null);
-      setSriBulkKeys("");
-
-      if (Array.isArray(payload.failed) && payload.failed.length > 0) {
-        setError(`${payload.failed.length} comprobantes no se pudieron recibir. Revisa que esten autorizados en el SRI.`);
-      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "No se pudo recibir comprobantes SRI.");
+      setError(err instanceof Error ? err.message : "No se pudo importar el periodo SRI.");
     } finally {
-      setIsSriBulkReceiving(false);
+      setIsSriPeriodImporting(false);
     }
   };
 
@@ -1094,28 +1092,67 @@ export default function App() {
                     </button>
                   </div>
                 ) : (
-                  <div className="grid gap-2">
-                    <textarea
-                      value={sriBulkKeys}
-                      onChange={(event) => setSriBulkKeys(event.target.value)}
-                      rows={4}
-                      placeholder="PEGA AQUI CLAVES DE ACCESO SRI, UNA POR LINEA O DESDE EXCEL"
-                      className="min-h-24 resize-y rounded-lg border border-slate-800 bg-slate-950 px-3 py-3 font-mono text-[11px] font-bold leading-relaxed text-slate-200 outline-none transition focus:border-cyan-500/40 placeholder:text-slate-700"
-                    />
-                    <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-                      <div className="text-[10px] font-bold uppercase tracking-widest text-slate-600">
-                        {sriBulkSummary
-                          ? `${sriBulkSummary.imported}/${sriBulkSummary.requested} recibidos, ${sriBulkSummary.failed} con error`
-                          : "Importacion masiva desde autorizacion SRI"}
-                      </div>
+                  <div className="grid gap-3">
+                    <div className="grid gap-2 md:grid-cols-[0.8fr_0.9fr_0.9fr_1.4fr_auto]">
+                      <select
+                        value={sriPeriodYear}
+                        onChange={(event) => setSriPeriodYear(event.target.value)}
+                        className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-3 text-[11px] font-black uppercase text-slate-200 outline-none transition focus:border-cyan-500/40"
+                      >
+                        {Array.from({ length: 8 }, (_, index) => new Date().getFullYear() - index).map((year) => (
+                          <option key={year} value={year}>{year}</option>
+                        ))}
+                      </select>
+                      <select
+                        value={sriPeriodMonth}
+                        onChange={(event) => setSriPeriodMonth(event.target.value)}
+                        className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-3 text-[11px] font-black uppercase text-slate-200 outline-none transition focus:border-cyan-500/40"
+                      >
+                        {[
+                          ["01", "Enero"], ["02", "Febrero"], ["03", "Marzo"], ["04", "Abril"],
+                          ["05", "Mayo"], ["06", "Junio"], ["07", "Julio"], ["08", "Agosto"],
+                          ["09", "Septiembre"], ["10", "Octubre"], ["11", "Noviembre"], ["12", "Diciembre"],
+                        ].map(([value, label]) => (
+                          <option key={value} value={value}>{label}</option>
+                        ))}
+                      </select>
+                      <select
+                        value={sriPeriodDay}
+                        onChange={(event) => setSriPeriodDay(event.target.value)}
+                        className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-3 text-[11px] font-black uppercase text-slate-200 outline-none transition focus:border-cyan-500/40"
+                      >
+                        <option value="0">Todo el mes</option>
+                        {Array.from({ length: 31 }, (_, index) => String(index + 1)).map((day) => (
+                          <option key={day} value={day}>{`Dia ${day}`}</option>
+                        ))}
+                      </select>
+                      <select
+                        value={sriVoucherType}
+                        onChange={(event) => setSriVoucherType(event.target.value as SriVoucherType)}
+                        className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-3 text-[11px] font-black uppercase text-slate-200 outline-none transition focus:border-cyan-500/40"
+                      >
+                        <option value="1">Factura</option>
+                        <option value="2">Liquidacion compra</option>
+                        <option value="3">Nota credito</option>
+                        <option value="4">Nota debito</option>
+                        <option value="6">Retencion</option>
+                      </select>
                       <button
-                        onClick={receiveSriBulk}
-                        disabled={isSriBulkReceiving}
+                        onClick={importSriPeriod}
+                        disabled={isSriPeriodImporting}
                         className="flex items-center justify-center gap-2 rounded-lg bg-cyan-600 px-4 py-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-cyan-500 disabled:opacity-40"
                       >
-                        {isSriBulkReceiving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
-                        {isSriBulkReceiving ? "Recibiendo..." : "Recibir masivo"}
+                        {isSriPeriodImporting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CalendarDays className="h-3.5 w-3.5" />}
+                        {isSriPeriodImporting ? "Importando..." : "Importar periodo"}
                       </button>
+                    </div>
+                    <div className="flex items-center justify-between gap-3 rounded-lg border border-slate-800 bg-slate-950/70 px-3 py-2">
+                      <span className="text-[10px] font-bold uppercase tracking-widest text-slate-600">
+                        {sriBulkSummary
+                          ? `${sriBulkSummary.imported}/${sriBulkSummary.requested} importados, ${sriBulkSummary.failed} con error`
+                          : "Importacion directa de comprobantes recibidos por periodo SRI"}
+                      </span>
+                      <RefreshCw className="h-3.5 w-3.5 shrink-0 text-slate-600" />
                     </div>
                   </div>
                 )}
