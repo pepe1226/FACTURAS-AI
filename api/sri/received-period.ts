@@ -19,7 +19,7 @@ type PeriodBody = {
   year?: number;
   month?: number;
   day?: number;
-  voucherType?: "1" | "2" | "3" | "4" | "6";
+  voucherType?: "0" | "1" | "2" | "3" | "4" | "6";
   environment?: "production" | "test";
 };
 

@@ -88,7 +88,7 @@ type SriBulkSummary = {
   failed: number;
 };
 
-type SriVoucherType = "1" | "2" | "3" | "4" | "6";
+type SriVoucherType = "0" | "1" | "2" | "3" | "4" | "6";
 
 const DEFAULT_ECUADOR_VAT_RATE = 0.15;
 
@@ -234,7 +234,7 @@ export default function App() {
   const [sriPeriodYear, setSriPeriodYear] = useState(String(new Date().getFullYear()));
   const [sriPeriodMonth, setSriPeriodMonth] = useState(String(new Date().getMonth() + 1).padStart(2, "0"));
   const [sriPeriodDay, setSriPeriodDay] = useState("0");
-  const [sriVoucherType, setSriVoucherType] = useState<SriVoucherType>("1");
+  const [sriVoucherType, setSriVoucherType] = useState<SriVoucherType>("0");
   const [isSriPeriodImporting, setIsSriPeriodImporting] = useState(false);
   
   // Sorting & Filtering
@@ -1131,7 +1131,8 @@ export default function App() {
                         onChange={(event) => setSriVoucherType(event.target.value as SriVoucherType)}
                         className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-3 text-[11px] font-black uppercase text-slate-200 outline-none transition focus:border-cyan-500/40"
                       >
-                        <option value="1">Factura</option>
+                        <option value="0">Factura</option>
+                        <option value="1">Todos</option>
                         <option value="2">Liquidacion compra</option>
                         <option value="3">Nota credito</option>
                         <option value="4">Nota debito</option>

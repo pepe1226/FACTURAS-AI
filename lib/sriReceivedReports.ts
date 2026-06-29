@@ -10,7 +10,7 @@ export type SriReceivedPeriodInput = {
   year: number;
   month: number;
   day: number;
-  voucherType: "1" | "2" | "3" | "4" | "6";
+  voucherType: "0" | "1" | "2" | "3" | "4" | "6";
   environment?: "production" | "test";
 };
 
@@ -96,6 +96,11 @@ function hashSriPassword(password: string) {
 
 function extractAccessKeys(html: string) {
   return Array.from(new Set(html.match(/\b\d{49}\b/g) || []));
+}
+
+function extractReceivedTableRows(html: string) {
+  const rowIds = [...html.matchAll(/tablaCompRecibidos:(\d+):lnkXml/g)].map((match) => Number(match[1]));
+  return Array.from(new Set(rowIds)).filter((index) => Number.isInteger(index) && index >= 0);
 }
 
 function htmlAttr(tag: string, name: string) {
@@ -190,6 +195,7 @@ async function submitReceivedPeriodFilter(html: string, jar: CookieJar, input: S
 
   const params = new URLSearchParams(form.params);
   params.set(form.id, form.id);
+  params.set(`${form.id}:opciones`, "ruc");
   setMatchingField(params, ["anio", "ano", "year"], String(input.year));
   setMatchingField(params, ["mes", "month"], String(input.month));
   setMatchingField(params, ["dia", "day"], String(input.day));
@@ -207,6 +213,8 @@ async function submitReceivedPeriodFilter(html: string, jar: CookieJar, input: S
     [`${formPrefix}:cmbDia`]: String(input.day),
     [`${formPrefix}:cmbTipoComprobante`]: input.voucherType,
     [`${formPrefix}:tipoComprobante`]: input.voucherType,
+    [`${formPrefix}:opciones`]: "ruc",
+    [`${formPrefix}:captcha`]: "",
   };
 
   for (const [key, value] of Object.entries(guessedFields)) {
@@ -259,6 +267,33 @@ async function submitReceivedPeriodFilter(html: string, jar: CookieJar, input: S
   return extractAccessKeys(ajaxHtml).length > 0 ? ajaxHtml : regularHtml;
 }
 
+async function downloadReceivedXmls(html: string, jar: CookieJar) {
+  const form = parseReceivedForm(html);
+  const rows = extractReceivedTableRows(html);
+  const formPrefix = form.id.includes(":") ? form.id.split(":")[0] : form.id;
+  const actionUrl = new URL(form.action, receivedPageUrl).toString();
+  const xmlBodies: string[] = [];
+
+  for (const rowIndex of rows.slice(0, 100)) {
+    const params = new URLSearchParams(form.params);
+    params.set(form.id, form.id);
+    params.set(`${formPrefix}:tablaCompRecibidos:${rowIndex}:lnkXml`, `${formPrefix}:tablaCompRecibidos:${rowIndex}:lnkXml`);
+
+    const response = await followSriRedirects(actionUrl, jar, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: "https://srienlinea.sri.gob.ec",
+        referer: receivedPageUrl,
+      },
+      body: params,
+    });
+    xmlBodies.push(await response.text());
+  }
+
+  return xmlBodies;
+}
+
 function looksLikeLoginFailed(html: string) {
   return /usuario|clave|credenciales|inv[aá]lid|incorrect/i.test(html) && /kc-form-login|login-pf/i.test(html);
 }
@@ -286,7 +321,7 @@ export function validateSriPeriod(input: Partial<SriReceivedPeriodInput>) {
     throw new Error("Selecciona un dia valido o usa Todo el mes.");
   }
 
-  if (!["1", "2", "3", "4", "6"].includes(voucherType)) {
+  if (!["0", "1", "2", "3", "4", "6"].includes(voucherType)) {
     throw new Error("Selecciona un tipo de comprobante SRI valido.");
   }
 
@@ -335,7 +370,7 @@ async function openReceivedPage(input: SriReceivedPeriodInput) {
   }
 
   if (hasReceivedForm(html)) {
-    return submitReceivedPeriodFilter(html, jar, input);
+    return { html: await submitReceivedPeriodFilter(html, jar, input), jar };
   }
 
   const receivedResponse = await followSriRedirects(receivedPageUrl, jar, {
@@ -349,7 +384,7 @@ async function openReceivedPage(input: SriReceivedPeriodInput) {
     throw new Error("El SRI solicito captcha o verificacion adicional al abrir comprobantes recibidos.");
   }
 
-  return submitReceivedPeriodFilter(receivedHtml, jar, input);
+  return { html: await submitReceivedPeriodFilter(receivedHtml, jar, input), jar };
 }
 
 export async function importSriReceivedPeriod(
@@ -357,12 +392,15 @@ export async function importSriReceivedPeriod(
 ): Promise<SriReceivedPeriodResult> {
   validateSriPeriod(input);
 
-  const reportHtml = await openReceivedPage(input);
-  const accessKeys = extractAccessKeys(reportHtml);
+  const report = await openReceivedPage(input);
+  const xmlBodies = await downloadReceivedXmls(report.html, report.jar);
+  const accessKeys = Array.from(
+    new Set([...extractAccessKeys(report.html), ...xmlBodies.flatMap((xml) => extractAccessKeys(xml))]),
+  );
 
   if (accessKeys.length === 0) {
     throw new Error(
-      "Se inicio sesion en el SRI, pero no se encontraron claves de acceso en la pantalla de comprobantes recibidos. Falta completar el envio del filtro de periodo del formulario JSF del SRI.",
+      "Se inicio sesion en el SRI, pero no se encontraron comprobantes XML para el periodo seleccionado. Revisa que existan facturas recibidas en ese mes o que el SRI no haya cambiado la tabla de resultados.",
     );
   }
 
