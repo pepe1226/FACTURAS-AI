@@ -22,7 +22,12 @@ import {
   FilterX,
   Sigma,
   Check,
-  MoreVertical
+  MoreVertical,
+  KeyRound,
+  LogIn,
+  LogOut,
+  ShieldCheck,
+  RefreshCw
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 
@@ -68,6 +73,19 @@ interface InvoiceResult {
 type SortField = "barcode" | "product" | "quantity" | "finalUnitCost" | "finalTotalCost";
 type SortOrder = "asc" | "desc" | null;
 type AggregationType = "sum" | "count" | "avg" | "min" | "max";
+
+type SriSessionState = {
+  id: string;
+  ruc: string;
+  username: string;
+  expiresAt: string;
+};
+
+type SriBulkSummary = {
+  requested: number;
+  imported: number;
+  failed: number;
+};
 
 const DEFAULT_ECUADOR_VAT_RATE = 0.15;
 
@@ -204,6 +222,14 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [sriAccessKey, setSriAccessKey] = useState("");
   const [isSriSyncing, setIsSriSyncing] = useState(false);
+  const [sriRuc, setSriRuc] = useState("");
+  const [sriUsername, setSriUsername] = useState("");
+  const [sriPassword, setSriPassword] = useState("");
+  const [sriSession, setSriSession] = useState<SriSessionState | null>(null);
+  const [sriBulkKeys, setSriBulkKeys] = useState("");
+  const [sriBulkSummary, setSriBulkSummary] = useState<SriBulkSummary | null>(null);
+  const [isSriLoggingIn, setIsSriLoggingIn] = useState(false);
+  const [isSriBulkReceiving, setIsSriBulkReceiving] = useState(false);
   
   // Sorting & Filtering
   const [sortField, setSortField] = useState<SortField | null>(null);
@@ -232,6 +258,24 @@ export default function App() {
   useEffect(() => {
     void loadInvoices();
   }, [loadInvoices]);
+
+  useEffect(() => {
+    const savedSession = window.sessionStorage.getItem("facturas-ai:sri-session");
+    if (!savedSession) return;
+
+    try {
+      const parsed = JSON.parse(savedSession) as SriSessionState;
+      if (parsed.expiresAt && new Date(parsed.expiresAt).getTime() > Date.now()) {
+        setSriSession(parsed);
+        setSriRuc(parsed.ruc);
+        setSriUsername(parsed.username);
+      } else {
+        window.sessionStorage.removeItem("facturas-ai:sri-session");
+      }
+    } catch {
+      window.sessionStorage.removeItem("facturas-ai:sri-session");
+    }
+  }, []);
 
   const handleUploadContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -419,6 +463,106 @@ export default function App() {
       setIsLoading(false);
       setProgress(0);
       setLoadingPhase("");
+    }
+  };
+
+  const loginSri = async () => {
+    setIsSriLoggingIn(true);
+    setError(null);
+    setSriBulkSummary(null);
+
+    try {
+      const response = await fetch("/api/sri/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ruc: sriRuc,
+          username: sriUsername || sriRuc,
+          password: sriPassword,
+        }),
+      });
+
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        throw new Error(payload?.error || "No se pudo iniciar sesion SRI.");
+      }
+
+      const session = await response.json();
+      setSriSession(session);
+      setSriRuc(session.ruc);
+      setSriUsername(session.username);
+      setSriPassword("");
+      window.sessionStorage.setItem("facturas-ai:sri-session", JSON.stringify(session));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "No se pudo iniciar sesion SRI.");
+    } finally {
+      setIsSriLoggingIn(false);
+    }
+  };
+
+  const logoutSri = async () => {
+    const sessionId = sriSession?.id;
+    setSriSession(null);
+    setSriPassword("");
+    setSriBulkSummary(null);
+    window.sessionStorage.removeItem("facturas-ai:sri-session");
+
+    if (!sessionId) return;
+
+    await fetch("/api/sri/session", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId }),
+    }).catch(() => null);
+  };
+
+  const receiveSriBulk = async () => {
+    if (!sriSession) {
+      setError("Inicia sesion SRI antes de recibir comprobantes.");
+      return;
+    }
+
+    const accessKeys = sriBulkKeys.match(/\d{49}/g) || [];
+    if (accessKeys.length === 0) {
+      setError("Pega una o mas claves de acceso SRI de 49 digitos.");
+      return;
+    }
+
+    setIsSriBulkReceiving(true);
+    setError(null);
+    setSriBulkSummary(null);
+
+    try {
+      const response = await fetch("/api/sri/bulk-receive", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: sriSession.id,
+          accessKeys,
+          environment: "production",
+        }),
+      });
+
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        throw new Error(payload?.error || "No se pudo recibir comprobantes SRI.");
+      }
+
+      const imported = Array.isArray(payload.imported) ? payload.imported as InvoiceResult[] : [];
+      setResults((prev) => {
+        const importedIds = new Set(imported.map((invoice) => invoice.id));
+        return [...imported, ...prev.filter((invoice) => !importedIds.has(invoice.id))];
+      });
+      setSriBulkSummary(payload.summary || null);
+      setSriBulkKeys("");
+
+      if (Array.isArray(payload.failed) && payload.failed.length > 0) {
+        setError(`${payload.failed.length} comprobantes no se pudieron recibir. Revisa que esten autorizados en el SRI.`);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "No se pudo recibir comprobantes SRI.");
+    } finally {
+      setIsSriBulkReceiving(false);
     }
   };
 
@@ -885,6 +1029,96 @@ export default function App() {
                     <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">{step}</span>
                   </div>
                 ))}
+              </div>
+
+              <div className="grid gap-3 rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border ${sriSession ? "border-green-500/30 bg-green-500/10 text-green-400" : "border-slate-800 bg-slate-900 text-slate-500"}`}>
+                      {sriSession ? <ShieldCheck className="h-4 w-4" /> : <KeyRound className="h-4 w-4" />}
+                    </div>
+                    <div className="min-w-0">
+                      <div className="text-[10px] font-black uppercase tracking-[0.25em] text-slate-500">Sesion SRI</div>
+                      <div className="truncate text-xs font-black uppercase text-slate-200">
+                        {sriSession ? `${sriSession.ruc} conectado` : "Conecta tu usuario SRI"}
+                      </div>
+                    </div>
+                  </div>
+                  {sriSession && (
+                    <button
+                      onClick={logoutSri}
+                      className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-800 bg-slate-900 text-slate-500 transition hover:text-red-300"
+                      title="Cerrar sesion SRI"
+                    >
+                      <LogOut className="h-4 w-4" />
+                    </button>
+                  )}
+                </div>
+
+                {!sriSession ? (
+                  <div className="grid gap-2 md:grid-cols-[1fr_1fr_1fr_auto]">
+                    <input
+                      value={sriRuc}
+                      onChange={(event) => {
+                        const value = event.target.value.replace(/\D/g, "").slice(0, 13);
+                        setSriRuc(value);
+                        if (!sriUsername || sriUsername === sriRuc) setSriUsername(value);
+                      }}
+                      inputMode="numeric"
+                      maxLength={13}
+                      placeholder="RUC"
+                      className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-3 font-mono text-[11px] font-bold text-slate-200 outline-none transition focus:border-cyan-500/40 placeholder:text-slate-700"
+                    />
+                    <input
+                      value={sriUsername}
+                      onChange={(event) => setSriUsername(event.target.value.replace(/\D/g, "").slice(0, 13))}
+                      inputMode="numeric"
+                      maxLength={13}
+                      placeholder="USUARIO SRI"
+                      className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-3 font-mono text-[11px] font-bold text-slate-200 outline-none transition focus:border-cyan-500/40 placeholder:text-slate-700"
+                    />
+                    <input
+                      value={sriPassword}
+                      onChange={(event) => setSriPassword(event.target.value)}
+                      type="password"
+                      placeholder="CLAVE SRI"
+                      className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-3 text-[11px] font-bold text-slate-200 outline-none transition focus:border-cyan-500/40 placeholder:text-slate-700"
+                    />
+                    <button
+                      onClick={loginSri}
+                      disabled={isSriLoggingIn}
+                      className="flex items-center justify-center gap-2 rounded-lg bg-green-600 px-4 py-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-green-500 disabled:opacity-40"
+                    >
+                      {isSriLoggingIn ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <LogIn className="h-3.5 w-3.5" />}
+                      Conectar
+                    </button>
+                  </div>
+                ) : (
+                  <div className="grid gap-2">
+                    <textarea
+                      value={sriBulkKeys}
+                      onChange={(event) => setSriBulkKeys(event.target.value)}
+                      rows={4}
+                      placeholder="PEGA AQUI CLAVES DE ACCESO SRI, UNA POR LINEA O DESDE EXCEL"
+                      className="min-h-24 resize-y rounded-lg border border-slate-800 bg-slate-950 px-3 py-3 font-mono text-[11px] font-bold leading-relaxed text-slate-200 outline-none transition focus:border-cyan-500/40 placeholder:text-slate-700"
+                    />
+                    <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                      <div className="text-[10px] font-bold uppercase tracking-widest text-slate-600">
+                        {sriBulkSummary
+                          ? `${sriBulkSummary.imported}/${sriBulkSummary.requested} recibidos, ${sriBulkSummary.failed} con error`
+                          : "Importacion masiva desde autorizacion SRI"}
+                      </div>
+                      <button
+                        onClick={receiveSriBulk}
+                        disabled={isSriBulkReceiving}
+                        className="flex items-center justify-center gap-2 rounded-lg bg-cyan-600 px-4 py-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-cyan-500 disabled:opacity-40"
+                      >
+                        {isSriBulkReceiving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                        {isSriBulkReceiving ? "Recibiendo..." : "Recibir masivo"}
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
 
               <div className="grid gap-2 md:grid-cols-[1fr_auto]">

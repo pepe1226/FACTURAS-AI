@@ -17,7 +17,7 @@ export function hasRedisConfigured() {
   return Boolean(url && token);
 }
 
-function getRedis() {
+export function getRedis() {
   if (redisClient) return redisClient;
 
   const { url, token } = redisConfig();
@@ -64,4 +64,23 @@ export async function deleteInvoiceItem(invoiceId: string, itemIndex: number) {
 
   await writeInvoices(nextInvoices);
   return nextInvoices;
+}
+
+export async function readJson<T>(key: string): Promise<T | null> {
+  if (!hasRedisConfigured()) return null;
+  return getRedis().get<T>(key);
+}
+
+export async function writeJson<T>(key: string, value: T, options?: { expiresInSeconds?: number }) {
+  if (options?.expiresInSeconds) {
+    await getRedis().set(key, value, { ex: options.expiresInSeconds });
+    return;
+  }
+
+  await getRedis().set(key, value);
+}
+
+export async function deleteKey(key: string) {
+  if (!hasRedisConfigured()) return;
+  await getRedis().del(key);
 }
