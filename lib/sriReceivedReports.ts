@@ -172,6 +172,11 @@ function firstSubmitControl(formHtml: string) {
   return controls.find((control) => /consult|buscar|filtrar|aceptar/i.test(control)) || controls[0] || "";
 }
 
+function hasReceivedForm(html: string) {
+  const form = parseReceivedForm(html);
+  return Boolean(form.html && /javax\.faces\.ViewState/i.test(form.html));
+}
+
 async function submitReceivedPeriodFilter(html: string, jar: CookieJar, input: SriReceivedPeriodInput) {
   const form = parseReceivedForm(html);
   if (!form.html) {
@@ -252,7 +257,7 @@ export function validateSriPeriod(input: Partial<SriReceivedPeriodInput>) {
 
 async function openReceivedPage(input: SriReceivedPeriodInput) {
   const jar: CookieJar = {};
-  const loginPageResponse = await followSriRedirects(tokenUrl, jar);
+  const loginPageResponse = await followSriRedirects(receivedPageUrl, jar);
   const loginPageHtml = await loginPageResponse.text();
   const loginAction = findLoginAction(loginPageHtml);
 
@@ -291,7 +296,22 @@ async function openReceivedPage(input: SriReceivedPeriodInput) {
     throw new Error("El SRI no acepto las credenciales ingresadas.");
   }
 
-  return submitReceivedPeriodFilter(html, jar, input);
+  if (hasReceivedForm(html)) {
+    return submitReceivedPeriodFilter(html, jar, input);
+  }
+
+  const receivedResponse = await followSriRedirects(receivedPageUrl, jar, {
+    headers: {
+      referer: tokenUrl,
+    },
+  });
+  const receivedHtml = await receivedResponse.text();
+
+  if (looksLikeHumanChallenge(receivedHtml)) {
+    throw new Error("El SRI solicito captcha o verificacion adicional al abrir comprobantes recibidos.");
+  }
+
+  return submitReceivedPeriodFilter(receivedHtml, jar, input);
 }
 
 export async function importSriReceivedPeriod(
