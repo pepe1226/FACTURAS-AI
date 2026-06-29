@@ -95,11 +95,12 @@ function hashSriPassword(password: string) {
 }
 
 function extractAccessKeys(html: string) {
-  return Array.from(new Set(html.match(/\b\d{49}\b/g) || []));
+  return Array.from(new Set(decodeHtml(html).match(/\b\d{49}\b/g) || []));
 }
 
 function extractReceivedTableRows(html: string) {
-  const rowIds = [...html.matchAll(/tablaCompRecibidos:(\d+):lnkXml/g)].map((match) => Number(match[1]));
+  const decodedHtml = decodeHtml(html);
+  const rowIds = [...decodedHtml.matchAll(/tablaCompRecibidos:(\d+):lnkXml/g)].map((match) => Number(match[1]));
   return Array.from(new Set(rowIds)).filter((index) => Number.isInteger(index) && index >= 0);
 }
 
@@ -155,6 +156,19 @@ function parseReceivedForm(html: string) {
   }
 
   return { id, action, html: formHtml, params };
+}
+
+function latestViewState(html: string) {
+  const decodedHtml = decodeHtml(html);
+  const partialMatch = decodedHtml.match(
+    /<update[^>]+id=["'](?:[^"']*:)?javax\.faces\.ViewState(?::\d+)?["'][^>]*>([\s\S]*?)<\/update>/i,
+  );
+  if (partialMatch?.[1]) return partialMatch[1].replace(/^<!\[CDATA\[/, "").replace(/\]\]>$/, "").trim();
+
+  const inputMatch = decodedHtml.match(
+    /<input\b[^>]+name=["']javax\.faces\.ViewState["'][^>]+value=["']([^"']+)["']/i,
+  );
+  return inputMatch ? decodeHtml(inputMatch[1]) : "";
 }
 
 function setMatchingField(params: URLSearchParams, candidates: string[], value: string) {
@@ -264,7 +278,7 @@ async function submitReceivedPeriodFilter(html: string, jar: CookieJar, input: S
   });
   const ajaxHtml = await ajaxResponse.text();
 
-  return extractAccessKeys(ajaxHtml).length > 0 ? ajaxHtml : regularHtml;
+  return `${regularHtml}\n${ajaxHtml}`;
 }
 
 async function downloadReceivedXmls(html: string, jar: CookieJar) {
@@ -273,10 +287,12 @@ async function downloadReceivedXmls(html: string, jar: CookieJar) {
   const formPrefix = form.id.includes(":") ? form.id.split(":")[0] : form.id;
   const actionUrl = new URL(form.action, receivedPageUrl).toString();
   const xmlBodies: string[] = [];
+  const viewState = latestViewState(html);
 
   for (const rowIndex of rows.slice(0, 100)) {
     const params = new URLSearchParams(form.params);
     params.set(form.id, form.id);
+    if (viewState) params.set("javax.faces.ViewState", viewState);
     params.set(`${formPrefix}:tablaCompRecibidos:${rowIndex}:lnkXml`, `${formPrefix}:tablaCompRecibidos:${rowIndex}:lnkXml`);
 
     const response = await followSriRedirects(actionUrl, jar, {
@@ -306,7 +322,7 @@ export function validateSriPeriod(input: Partial<SriReceivedPeriodInput>) {
   const year = Number(input.year);
   const month = Number(input.month);
   const day = Number(input.day ?? 0);
-  const voucherType = String(input.voucherType || "1") as SriReceivedPeriodInput["voucherType"];
+  const voucherType = String(input.voucherType || "0") as SriReceivedPeriodInput["voucherType"];
   const currentYear = new Date().getFullYear();
 
   if (!Number.isInteger(year) || year < 2010 || year > currentYear + 1) {
