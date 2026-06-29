@@ -167,7 +167,12 @@ function firstSubmitControl(formHtml: string) {
   const controls = [
     ...formHtml.matchAll(/<button\b[^>]*>[\s\S]*?<\/button>/gi),
     ...formHtml.matchAll(/<input\b[^>]*>/gi),
-  ].map((match) => match[0]);
+  ]
+    .map((match) => match[0])
+    .filter((control) => {
+      const type = normalizeName(htmlAttr(control, "type") || "submit");
+      return ["button", "submit", "image"].includes(type) || /consult|buscar|filtrar|aceptar/i.test(control);
+    });
 
   return controls.find((control) => /consult|buscar|filtrar|aceptar/i.test(control)) || controls[0] || "";
 }
@@ -194,8 +199,12 @@ async function submitReceivedPeriodFilter(html: string, jar: CookieJar, input: S
   const guessedFields: Record<string, string> = {
     [`${formPrefix}:ano`]: String(input.year),
     [`${formPrefix}:anio`]: String(input.year),
+    [`${formPrefix}:cmbAnio`]: String(input.year),
+    [`${formPrefix}:cmbAno`]: String(input.year),
     [`${formPrefix}:mes`]: String(input.month),
+    [`${formPrefix}:cmbMes`]: String(input.month),
     [`${formPrefix}:dia`]: String(input.day),
+    [`${formPrefix}:cmbDia`]: String(input.day),
     [`${formPrefix}:cmbTipoComprobante`]: input.voucherType,
     [`${formPrefix}:tipoComprobante`]: input.voucherType,
   };
@@ -205,10 +214,15 @@ async function submitReceivedPeriodFilter(html: string, jar: CookieJar, input: S
   }
 
   const submitControl = firstSubmitControl(form.html);
-  const submitName = htmlAttr(submitControl, "name") || htmlAttr(submitControl, "id") || `${formPrefix}:btnConsultar`;
+  const submitName =
+    htmlAttr(submitControl, "name") ||
+    htmlAttr(submitControl, "id") ||
+    (params.has(`${formPrefix}:btnConsultar`) ? `${formPrefix}:btnConsultar` : `${formPrefix}:j_idtConsultar`);
   params.set(submitName, htmlAttr(submitControl, "value") || "Consultar");
+  params.set(`${formPrefix}:btnConsultar`, params.get(`${formPrefix}:btnConsultar`) || "Consultar");
 
-  const response = await followSriRedirects(new URL(form.action, receivedPageUrl).toString(), jar, {
+  const actionUrl = new URL(form.action, receivedPageUrl).toString();
+  const response = await followSriRedirects(actionUrl, jar, {
     method: "POST",
     headers: {
       "content-type": "application/x-www-form-urlencoded",
@@ -218,7 +232,31 @@ async function submitReceivedPeriodFilter(html: string, jar: CookieJar, input: S
     body: params,
   });
 
-  return response.text();
+  const regularHtml = await response.text();
+  if (extractAccessKeys(regularHtml).length > 0) return regularHtml;
+
+  const ajaxParams = new URLSearchParams(params);
+  ajaxParams.set("javax.faces.partial.ajax", "true");
+  ajaxParams.set("javax.faces.source", submitName);
+  ajaxParams.set("javax.faces.partial.execute", "@all");
+  ajaxParams.set("javax.faces.partial.render", "@all");
+  ajaxParams.set(submitName, submitName);
+
+  const ajaxResponse = await followSriRedirects(actionUrl, jar, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+      "faces-request": "partial/ajax",
+      "x-requested-with": "XMLHttpRequest",
+      accept: "application/xml, text/xml, */*; q=0.01",
+      origin: "https://srienlinea.sri.gob.ec",
+      referer: receivedPageUrl,
+    },
+    body: ajaxParams,
+  });
+  const ajaxHtml = await ajaxResponse.text();
+
+  return extractAccessKeys(ajaxHtml).length > 0 ? ajaxHtml : regularHtml;
 }
 
 function looksLikeLoginFailed(html: string) {
