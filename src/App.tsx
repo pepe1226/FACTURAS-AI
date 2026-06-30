@@ -177,6 +177,24 @@ function fileToBase64(file: File): Promise<string> {
   });
 }
 
+function friendlyProcessingError(error: unknown) {
+  const rawMessage = error instanceof Error ? error.message : "Error desconocido";
+  let message = rawMessage;
+
+  try {
+    const parsed = JSON.parse(rawMessage);
+    message = parsed?.error?.message || parsed?.error || parsed?.message || rawMessage;
+  } catch {
+    // Keep the original text when it is not JSON.
+  }
+
+  if (/503|UNAVAILABLE|high demand|saturad|overloaded|temporar/i.test(message)) {
+    return "El lector visual esta ocupado por alta demanda. La app ya intento reintentos y modelos alternos; espera unos segundos y pulsa Procesar otra vez.";
+  }
+
+  return message;
+}
+
 async function optimizeImage(base64: string, maxDimension = 2048): Promise<string> {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -385,7 +403,7 @@ export default function App() {
       }
 
       setProgress(25);
-      setLoadingPhase("Analizando con IA...");
+      setLoadingPhase(isXml ? "Leyendo datos del XML..." : "Analizando con lector visual...");
       
       const response = await fetch("/api/extract-invoice", {
         method: "POST",
@@ -465,7 +483,7 @@ export default function App() {
       }, 500);
     } catch (err) {
       console.error("Error processing file:", err);
-      setError(`Error al procesar: ${err instanceof Error ? err.message : "Error desconocido"}`);
+      setError(`Error al procesar: ${friendlyProcessingError(err)}`);
       setIsLoading(false);
       setProgress(0);
       setLoadingPhase("");

@@ -139,6 +139,17 @@ function isTemporaryAiError(error: unknown) {
   return /503|UNAVAILABLE|high demand|overloaded|temporar/i.test(message);
 }
 
+function aiModelsToTry() {
+  return Array.from(
+    new Set([
+      process.env.GEMINI_MODEL || "gemini-3-flash-preview",
+      "gemini-2.5-flash",
+      "gemini-2.0-flash",
+      "gemini-1.5-flash",
+    ]),
+  );
+}
+
 export async function extractInvoice(input: ExtractInvoiceInput) {
   const isXml =
     Boolean(input.xmlText) ||
@@ -176,56 +187,58 @@ export async function extractInvoice(input: ExtractInvoiceInput) {
   ];
 
   let lastError: unknown;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      const response = await ai.models.generateContent({
-        model: process.env.GEMINI_MODEL || "gemini-3-flash-preview",
-        contents,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              supplier: { type: Type.STRING },
-              supplierRuc: { type: Type.STRING },
-              invoiceNumber: { type: Type.STRING },
-              invoiceDate: { type: Type.STRING },
-              accessKey: { type: Type.STRING },
-              authorizationDate: { type: Type.STRING },
-              invoiceTotalPaid: { type: Type.NUMBER },
-              currency: { type: Type.STRING },
-              items: {
-                type: Type.ARRAY,
+  for (const model of aiModelsToTry()) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const response = await ai.models.generateContent({
+          model,
+          contents,
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                supplier: { type: Type.STRING },
+                supplierRuc: { type: Type.STRING },
+                invoiceNumber: { type: Type.STRING },
+                invoiceDate: { type: Type.STRING },
+                accessKey: { type: Type.STRING },
+                authorizationDate: { type: Type.STRING },
+                invoiceTotalPaid: { type: Type.NUMBER },
+                currency: { type: Type.STRING },
                 items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    barcode: { type: Type.STRING },
-                    product: { type: Type.STRING },
-                    quantity: { type: Type.NUMBER },
-                    finalUnitCost: { type: Type.NUMBER },
-                    finalTotalCost: { type: Type.NUMBER },
-                    taxCategory: { type: Type.STRING, enum: ["IVA_15", "IVA_0", "UNKNOWN"] },
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      barcode: { type: Type.STRING },
+                      product: { type: Type.STRING },
+                      quantity: { type: Type.NUMBER },
+                      finalUnitCost: { type: Type.NUMBER },
+                      finalTotalCost: { type: Type.NUMBER },
+                      taxCategory: { type: Type.STRING, enum: ["IVA_15", "IVA_0", "UNKNOWN"] },
+                    },
+                    required: ["product", "quantity", "finalUnitCost", "finalTotalCost"],
                   },
-                  required: ["product", "quantity", "finalUnitCost", "finalTotalCost"],
                 },
+                notes: { type: Type.ARRAY, items: { type: Type.STRING } },
               },
-              notes: { type: Type.ARRAY, items: { type: Type.STRING } },
+              required: ["invoiceTotalPaid", "items"],
             },
-            required: ["invoiceTotalPaid", "items"],
           },
-        },
-      });
+        });
 
-      return JSON.parse(response.text || "{}");
-    } catch (error) {
-      lastError = error;
-      if (!isTemporaryAiError(error) || attempt === 2) break;
-      await wait(800 * (attempt + 1));
+        return JSON.parse(response.text || "{}");
+      } catch (error) {
+        lastError = error;
+        if (!isTemporaryAiError(error)) throw error;
+        await wait(900 * (attempt + 1));
+      }
     }
   }
 
   if (isTemporaryAiError(lastError)) {
-    throw new Error("Gemini esta temporalmente saturado. Intenta otra vez en unos segundos o sube el XML original del SRI.");
+    throw new Error("El lector visual esta temporalmente saturado. Reintenta en unos segundos; la app probara automaticamente modelos alternos.");
   }
 
   throw lastError;
