@@ -564,6 +564,18 @@ export default function App() {
     }
   };
 
+  const copySriBrowserConnector = async () => {
+    const endpoint = `${window.location.origin}/api/sri/import-xml-batch`;
+    const connector = `javascript:(async()=>{const endpoint=${JSON.stringify(endpoint)};const form=document.querySelector('form');if(!form){alert('No se encontro formulario del SRI. Abre Comprobantes recibidos y consulta un periodo.');return;}const links=[...document.querySelectorAll('[id*=\"tablaCompRecibidos\"][id$=\"lnkXml\"],[name*=\"tablaCompRecibidos\"][name$=\"lnkXml\"]')];if(!links.length){alert('No se encontraron enlaces XML. Primero consulta el periodo en Comprobantes recibidos.');return;}const xmlTexts=[];for(const link of links.slice(0,150)){const id=link.id||link.name;const body=new URLSearchParams(new FormData(form));body.set(form.id||form.name,form.id||form.name);body.set(id,id);const response=await fetch(form.action||location.href,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},credentials:'include',body});xmlTexts.push(await response.text());}const result=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({xmlTexts})});const payload=await result.json();if(!result.ok){alert(payload.error||'No se pudo enviar a Facturas AI');return;}alert('Facturas AI: '+(payload.summary?.imported||0)+' importadas, '+(payload.summary?.failed||0)+' con error.');})();`;
+
+    try {
+      await navigator.clipboard.writeText(connector);
+      setError("Conector copiado. Pegalo como URL en un marcador del navegador y ejecutalo dentro de la pantalla Comprobantes recibidos del SRI.");
+    } catch {
+      setError("No se pudo copiar el conector. Permite acceso al portapapeles e intenta otra vez.");
+    }
+  };
+
   const consultSriByAccessKey = async () => {
     const cleanAccessKey = sriAccessKey.replace(/\D/g, "");
     if (cleanAccessKey.length !== 49) {
@@ -1155,6 +1167,13 @@ export default function App() {
                       </span>
                       <RefreshCw className="h-3.5 w-3.5 shrink-0 text-slate-600" />
                     </div>
+                    <button
+                      onClick={copySriBrowserConnector}
+                      className="flex items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-4 py-3 text-[10px] font-black uppercase tracking-widest text-slate-300 transition hover:border-cyan-500/40 hover:text-cyan-300"
+                    >
+                      <Copy className="h-3.5 w-3.5" />
+                      Copiar conector navegador SRI
+                    </button>
                   </div>
                 )}
               </div>

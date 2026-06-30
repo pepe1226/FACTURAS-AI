@@ -24,38 +24,73 @@ const receivedPageUrl =
   "https://srienlinea.sri.gob.ec/comprobantes-electronicos-internet/pages/consultas/recibidos/comprobantesRecibidos.jsf";
 const tokenUrl = `https://srienlinea.sri.gob.ec/tuportal-internet/GeneraToken.jsp?urlAplicacion=${encodeURIComponent(receivedPageUrl)}`;
 
-type CookieJar = Record<string, string>;
+type SriCookie = {
+  name: string;
+  value: string;
+  domain: string;
+  path: string;
+};
 
-function cookieHeader(jar: CookieJar) {
-  return Object.entries(jar)
-    .map(([name, value]) => `${name}=${value}`)
+type CookieJar = SriCookie[];
+
+function cookieHeader(jar: CookieJar, url: string) {
+  const current = new URL(url);
+  return jar
+    .filter((cookie) => {
+      const domain = cookie.domain.startsWith(".") ? cookie.domain.slice(1) : cookie.domain;
+      return current.hostname.endsWith(domain) && current.pathname.startsWith(cookie.path);
+    })
+    .sort((left, right) => right.path.length - left.path.length)
+    .map((cookie) => `${cookie.name}=${cookie.value}`)
     .join("; ");
 }
 
-function storeCookies(jar: CookieJar, setCookieHeader: string | null) {
+function storeCookies(jar: CookieJar, setCookieHeader: string | null, url: string) {
   if (!setCookieHeader) return;
+  const current = new URL(url);
 
   for (const cookie of setCookieHeader.split(/,(?=\s*[^;,]+=)/)) {
-    const [pair] = cookie.trim().split(";");
+    const parts = cookie.trim().split(";");
+    const [pair] = parts;
     const separator = pair.indexOf("=");
     if (separator > 0) {
-      jar[pair.slice(0, separator)] = pair.slice(separator + 1);
+      const name = pair.slice(0, separator);
+      const value = pair.slice(separator + 1);
+      const path = parts
+        .map((part) => part.trim())
+        .find((part) => /^path=/i.test(part))
+        ?.replace(/^path=/i, "") || "/";
+      const domain = parts
+        .map((part) => part.trim())
+        .find((part) => /^domain=/i.test(part))
+        ?.replace(/^domain=/i, "") || current.hostname;
+      const existing = jar.findIndex((item) => item.name === name && item.path === path && item.domain === domain);
+      const nextCookie = { name, value, path, domain };
+      if (existing >= 0) jar[existing] = nextCookie;
+      else jar.push(nextCookie);
     }
   }
 }
 
 async function sriFetch(url: string, jar: CookieJar, init: RequestInit = {}) {
   const headers = new Headers(init.headers || {});
-  headers.set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+  headers.set(
+    "user-agent",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+  );
+  headers.set("sec-ch-ua", '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"');
+  headers.set("sec-ch-ua-mobile", "?0");
+  headers.set("sec-ch-ua-platform", '"Windows"');
   headers.set("accept", headers.get("accept") || "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
-  if (Object.keys(jar).length > 0) headers.set("cookie", cookieHeader(jar));
+  const cookies = cookieHeader(jar, url);
+  if (cookies) headers.set("cookie", cookies);
 
   const response = await fetch(url, {
     ...init,
     redirect: "manual",
     headers,
   });
-  storeCookies(jar, response.headers.get("set-cookie"));
+  storeCookies(jar, response.headers.get("set-cookie"), url);
   return response;
 }
 
@@ -345,7 +380,7 @@ export function validateSriPeriod(input: Partial<SriReceivedPeriodInput>) {
 }
 
 async function openReceivedPage(input: SriReceivedPeriodInput) {
-  const jar: CookieJar = {};
+  const jar: CookieJar = [];
   const loginPageResponse = await followSriRedirects(receivedPageUrl, jar);
   const loginPageHtml = await loginPageResponse.text();
   const loginAction = findLoginAction(loginPageHtml);
