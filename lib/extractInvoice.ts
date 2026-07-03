@@ -5,6 +5,7 @@ type ExtractInvoiceInput = {
   mimeType?: string;
   data?: string;
   xmlText?: string;
+  text?: string;
 };
 
 type SriXmlItem = {
@@ -139,6 +140,63 @@ function isTemporaryAiError(error: unknown) {
   return /503|UNAVAILABLE|high demand|overloaded|temporar/i.test(message);
 }
 
+function splitReportLine(line: string) {
+  const delimiter = ["\t", "|", ";", ","].find((candidate) => line.includes(candidate)) || /\s{2,}/;
+  return line.split(delimiter).map((cell) => cell.trim().replace(/^"|"$/g, ""));
+}
+
+function parseReportTotal(cells: string[]) {
+  const candidates = cells
+    .map((cell) => cell.replace(",", ".").replace(/[^\d.-]/g, ""))
+    .map(Number)
+    .filter((value) => Number.isFinite(value) && value > 0);
+  return candidates.length ? roundMoney(candidates[candidates.length - 1]) : 0;
+}
+
+function extractSriTxtReport(text: string, fileName = "reporte-sri.txt") {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const invoices = lines
+    .map((line, index) => {
+      const accessKey = line.match(/\b\d{49}\b/)?.[0] || "";
+      if (!accessKey) return null;
+
+      const cells = splitReportLine(line);
+      const ruc = cells.find((cell) => /^\d{13}$/.test(cell) && cell !== accessKey.slice(10, 23)) || "";
+      const dateCell = cells.find((cell) => /\b\d{2}\/\d{2}\/\d{4}\b|\b\d{4}-\d{2}-\d{2}\b/.test(cell)) || "";
+      const supplier =
+        cells.find((cell) => /[A-Za-zÁÉÍÓÚÑáéíóúñ]{3}/.test(cell) && !/\bFACTURA\b/i.test(cell) && cell.length > 5) ||
+        "Proveedor SRI";
+      const invoiceNumber = cells.find((cell) => /\b\d{3}-\d{3}-\d{6,9}\b/.test(cell)) || "";
+
+      return {
+        id: accessKey,
+        fileName,
+        source: "SRI_RECEIVED" as const,
+        category: "REVISION" as const,
+        supplier,
+        supplierRuc: ruc,
+        invoiceNumber,
+        invoiceDate: normalizeDate(dateCell),
+        accessKey,
+        authorizationDate: "",
+        sriReceptionStatus: "Pendiente mapeo" as const,
+        invoiceTotalPaid: parseReportTotal(cells),
+        currency: "USD" as const,
+        items: [],
+        status: "REVIEW" as const,
+        difference: 0,
+        notes: [`Importada desde reporte TXT SRI, linea ${index + 1}. Sube el XML para registrar productos.`],
+      };
+    })
+    .filter((invoice): invoice is NonNullable<typeof invoice> => invoice !== null);
+
+  return invoices;
+}
+
 function aiModelsToTry() {
   return Array.from(
     new Set([
@@ -155,17 +213,32 @@ export async function extractInvoice(input: ExtractInvoiceInput) {
     Boolean(input.xmlText) ||
     input.fileName?.toLowerCase().endsWith(".xml") ||
     input.mimeType?.includes("xml");
+  const isTxt =
+    Boolean(input.text) ||
+    input.fileName?.toLowerCase().endsWith(".txt") ||
+    input.mimeType?.includes("text/plain");
 
   if (isXml && !input.xmlText) {
     throw new Error("El XML no contiene texto para analizar.");
   }
-  if (!isXml && !input.data) {
+  if (isTxt && !input.text) {
+    throw new Error("El reporte TXT no contiene texto para analizar.");
+  }
+  if (!isXml && !isTxt && !input.data) {
     throw new Error("El archivo no contiene datos para analizar.");
   }
 
   if (isXml && input.xmlText) {
     const xmlResult = extractSriXmlInvoice(input.xmlText);
     if (xmlResult) return xmlResult;
+  }
+
+  if (isTxt && input.text) {
+    const invoices = extractSriTxtReport(input.text, input.fileName);
+    if (invoices.length === 0) {
+      throw new Error("No se encontraron claves de acceso en el reporte TXT del SRI.");
+    }
+    return { reportInvoices: invoices, invoiceTotalPaid: 0, items: [], notes: [`Reporte TXT SRI con ${invoices.length} comprobantes.`] };
   }
 
   const apiKey = process.env.GEMINI_API_KEY;

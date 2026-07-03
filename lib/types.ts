@@ -2,6 +2,7 @@ export type TaxCategory = "IVA_15" | "IVA_0" | "UNKNOWN";
 export type InvoiceStatus = "OK" | "REVIEW";
 export type InvoiceSource = "AI_UPLOAD" | "SRI_RECEIVED";
 export type SriReceptionStatus = "Pendiente mapeo" | "Listo para ingresar" | "Ingresado";
+export type InvoiceCategory = "SIN_CATEGORIA" | "INVENTARIO" | "GASTO" | "SERVICIO" | "ACTIVO" | "REVISION";
 
 export type InvoiceItem = {
   barcode: string;
@@ -17,6 +18,7 @@ export type InvoiceResult = {
   id: string;
   fileName: string;
   source?: InvoiceSource;
+  category?: InvoiceCategory;
   supplier?: string;
   supplierRuc?: string;
   invoiceNumber?: string;
@@ -31,6 +33,23 @@ export type InvoiceResult = {
   difference: number;
   notes: string[];
   error?: string;
+};
+
+export type ProductPurchaseInfo = {
+  id: string;
+  barcode: string;
+  product: string;
+  supplier?: string;
+  supplierRuc?: string;
+  invoiceId: string;
+  invoiceNumber?: string;
+  invoiceDate?: string;
+  quantity: number;
+  lastUnitCost: number;
+  lastTotalCost: number;
+  taxCategory?: TaxCategory;
+  updatedAt: string;
+  purchaseCount: number;
 };
 
 export type ApiRequest = {

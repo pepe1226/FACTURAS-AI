@@ -1,7 +1,8 @@
 import { Redis } from "@upstash/redis";
-import type { InvoiceResult } from "./types.js";
+import type { InvoiceResult, ProductPurchaseInfo } from "./types.js";
 
 const invoicesKey = "facturas-ai:invoices";
+const productsKey = "facturas-ai:products";
 
 let redisClient: Redis | null = null;
 
@@ -41,6 +42,7 @@ export async function readInvoices(): Promise<InvoiceResult[]> {
 
 export async function writeInvoices(invoices: InvoiceResult[]) {
   await getRedis().set(invoicesKey, invoices);
+  await rebuildProducts(invoices);
 }
 
 export async function upsertInvoice(invoice: InvoiceResult) {
@@ -64,6 +66,55 @@ export async function deleteInvoiceItem(invoiceId: string, itemIndex: number) {
 
   await writeInvoices(nextInvoices);
   return nextInvoices;
+}
+
+function productKey(barcode: string, product: string) {
+  const cleanBarcode = barcode.trim();
+  if (cleanBarcode) return `barcode:${cleanBarcode}`;
+  return `name:${product.trim().toLowerCase().replace(/\s+/g, " ")}`;
+}
+
+export async function rebuildProducts(invoices = [] as InvoiceResult[]) {
+  const products = new Map<string, ProductPurchaseInfo>();
+
+  for (const invoice of [...invoices].reverse()) {
+    for (const item of invoice.items || []) {
+      const product = String(item.product || "").trim();
+      if (!product) continue;
+
+      const key = productKey(String(item.barcode || ""), product);
+      const previous = products.get(key);
+      products.set(key, {
+        id: key,
+        barcode: String(item.barcode || ""),
+        product,
+        supplier: invoice.supplier,
+        supplierRuc: invoice.supplierRuc,
+        invoiceId: invoice.id,
+        invoiceNumber: invoice.invoiceNumber,
+        invoiceDate: invoice.invoiceDate,
+        quantity: Number(item.quantity || 0),
+        lastUnitCost: Number(item.finalUnitCost || 0),
+        lastTotalCost: Number(item.finalTotalCost || 0),
+        taxCategory: item.taxCategory,
+        updatedAt: new Date().toISOString(),
+        purchaseCount: (previous?.purchaseCount || 0) + 1,
+      });
+    }
+  }
+
+  const sortedProducts = Array.from(products.values()).sort((left, right) => left.product.localeCompare(right.product));
+  await getRedis().set(productsKey, sortedProducts);
+  return sortedProducts;
+}
+
+export async function readProducts(): Promise<ProductPurchaseInfo[]> {
+  if (!hasRedisConfigured()) return [];
+
+  const products = await getRedis().get<ProductPurchaseInfo[]>(productsKey);
+  if (Array.isArray(products)) return products;
+
+  return rebuildProducts(await readInvoices());
 }
 
 export async function readJson<T>(key: string): Promise<T | null> {

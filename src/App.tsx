@@ -40,6 +40,7 @@ type TaxCategory = "IVA_15" | "IVA_0" | "UNKNOWN";
 type InvoiceStatus = "OK" | "REVIEW";
 type InvoiceSource = "AI_UPLOAD" | "SRI_RECEIVED";
 type SriReceptionStatus = "Pendiente mapeo" | "Listo para ingresar" | "Ingresado";
+type InvoiceCategory = "SIN_CATEGORIA" | "INVENTARIO" | "GASTO" | "SERVICIO" | "ACTIVO" | "REVISION";
 
 interface InvoiceItem {
   barcode: string;
@@ -55,6 +56,7 @@ interface InvoiceResult {
   id: string;
   fileName: string;
   source?: InvoiceSource;
+  category?: InvoiceCategory;
   supplier?: string;
   supplierRuc?: string;
   invoiceNumber?: string;
@@ -71,26 +73,36 @@ interface InvoiceResult {
   error?: string;
 }
 
+interface ProductPurchaseInfo {
+  id: string;
+  barcode: string;
+  product: string;
+  supplier?: string;
+  supplierRuc?: string;
+  invoiceId: string;
+  invoiceNumber?: string;
+  invoiceDate?: string;
+  quantity: number;
+  lastUnitCost: number;
+  lastTotalCost: number;
+  taxCategory?: TaxCategory;
+  updatedAt: string;
+  purchaseCount: number;
+}
+
 type SortField = "barcode" | "product" | "quantity" | "finalUnitCost" | "finalTotalCost";
 type SortOrder = "asc" | "desc" | null;
 type AggregationType = "sum" | "count" | "avg" | "min" | "max";
 
-type SriSessionState = {
-  id: string;
-  ruc: string;
-  username: string;
-  expiresAt: string;
-};
-
-type SriBulkSummary = {
-  requested: number;
-  imported: number;
-  failed: number;
-};
-
-type SriVoucherType = "0" | "1" | "2" | "3" | "4" | "6";
-
 const DEFAULT_ECUADOR_VAT_RATE = 0.15;
+const CATEGORY_OPTIONS: { value: InvoiceCategory; label: string }[] = [
+  { value: "SIN_CATEGORIA", label: "Sin categoria" },
+  { value: "INVENTARIO", label: "Inventario" },
+  { value: "GASTO", label: "Gasto" },
+  { value: "SERVICIO", label: "Servicio" },
+  { value: "ACTIVO", label: "Activo" },
+  { value: "REVISION", label: "Revision" },
+];
 
 const EXTRACTION_PROMPT = `
 Eres un extractor experto de comprobantes, tickets y facturas de Ecuador. Tu misión es la precisión absoluta.
@@ -235,25 +247,14 @@ async function optimizeImage(base64: string, maxDimension = 2048): Promise<strin
 
 export default function App() {
   const [results, setResults] = useState<InvoiceResult[]>([]);
+  const [products, setProducts] = useState<ProductPurchaseInfo[]>([]);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [progress, setProgress] = useState(0);
   const [loadingPhase, setLoadingPhase] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
+  const [categoryFilter, setCategoryFilter] = useState<InvoiceCategory | "TODAS">("TODAS");
   const [error, setError] = useState<string | null>(null);
-  const [sriAccessKey, setSriAccessKey] = useState("");
-  const [isSriSyncing, setIsSriSyncing] = useState(false);
-  const [sriRuc, setSriRuc] = useState("");
-  const [sriUsername, setSriUsername] = useState("");
-  const [sriPassword, setSriPassword] = useState("");
-  const [sriSession, setSriSession] = useState<SriSessionState | null>(null);
-  const [sriBulkSummary, setSriBulkSummary] = useState<SriBulkSummary | null>(null);
-  const [isSriLoggingIn, setIsSriLoggingIn] = useState(false);
-  const [sriPeriodYear, setSriPeriodYear] = useState(String(new Date().getFullYear()));
-  const [sriPeriodMonth, setSriPeriodMonth] = useState(String(new Date().getMonth() + 1).padStart(2, "0"));
-  const [sriPeriodDay, setSriPeriodDay] = useState("0");
-  const [sriVoucherType, setSriVoucherType] = useState<SriVoucherType>("0");
-  const [isSriPeriodImporting, setIsSriPeriodImporting] = useState(false);
   
   // Sorting & Filtering
   const [sortField, setSortField] = useState<SortField | null>(null);
@@ -279,27 +280,20 @@ export default function App() {
     }
   }, []);
 
-  useEffect(() => {
-    void loadInvoices();
-  }, [loadInvoices]);
-
-  useEffect(() => {
-    const savedSession = window.sessionStorage.getItem("facturas-ai:sri-session");
-    if (!savedSession) return;
-
+  const loadProducts = useCallback(async () => {
     try {
-      const parsed = JSON.parse(savedSession) as SriSessionState;
-      if (parsed.expiresAt && new Date(parsed.expiresAt).getTime() > Date.now()) {
-        setSriSession(parsed);
-        setSriRuc(parsed.ruc);
-        setSriUsername(parsed.username);
-      } else {
-        window.sessionStorage.removeItem("facturas-ai:sri-session");
-      }
-    } catch {
-      window.sessionStorage.removeItem("facturas-ai:sri-session");
+      const response = await fetch("/api/products");
+      if (!response.ok) throw new Error("No se pudo cargar historial de productos.");
+      setProducts(await response.json());
+    } catch (err) {
+      console.warn(err);
     }
   }, []);
+
+  useEffect(() => {
+    void loadInvoices();
+    void loadProducts();
+  }, [loadInvoices, loadProducts]);
 
   const handleUploadContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -388,6 +382,7 @@ export default function App() {
       
       let base64 = initialBase64;
       const isXml = selectedFile.type.includes("xml") || selectedFile.name.toLowerCase().endsWith(".xml");
+      const isTxt = selectedFile.type.includes("text/plain") || selectedFile.name.toLowerCase().endsWith(".txt");
       
       if (selectedFile.type.startsWith("image/")) {
         setLoadingPhase("Optimizando imagen...");
@@ -398,21 +393,24 @@ export default function App() {
         }
       } else if (isXml) {
         setLoadingPhase("Leyendo XML...");
+      } else if (isTxt) {
+        setLoadingPhase("Leyendo reporte TXT SRI...");
       } else {
         setLoadingPhase("Preparando documento...");
       }
 
       setProgress(25);
-      setLoadingPhase(isXml ? "Leyendo datos del XML..." : "Analizando con lector visual...");
+      setLoadingPhase(isXml || isTxt ? "Leyendo datos estructurados..." : "Analizando con lector visual...");
       
       const response = await fetch("/api/extract-invoice", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           fileName: selectedFile.name,
-          mimeType: selectedFile.type || (isXml ? "application/xml" : "image/jpeg"),
-          data: isXml ? undefined : base64,
+          mimeType: selectedFile.type || (isXml ? "application/xml" : isTxt ? "text/plain" : "image/jpeg"),
+          data: isXml || isTxt ? undefined : base64,
           xmlText: isXml ? await selectedFile.text() : undefined,
+          text: isTxt ? await selectedFile.text() : undefined,
         }),
       });
 
@@ -425,6 +423,40 @@ export default function App() {
       setLoadingPhase("Procesando respuesta...");
 
       const rawData = await response.json();
+      if (Array.isArray(rawData.reportInvoices)) {
+        setProgress(80);
+        setLoadingPhase("Guardando reporte TXT...");
+        const savedInvoices: InvoiceResult[] = [];
+
+        for (const reportInvoice of rawData.reportInvoices as InvoiceResult[]) {
+          const saveResponse = await fetch("/api/invoices", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(reportInvoice),
+          });
+
+          if (!saveResponse.ok) {
+            const payload = await saveResponse.json().catch(() => null);
+            throw new Error(payload?.error || "No se pudo guardar una factura del reporte TXT.");
+          }
+
+          savedInvoices.push(await saveResponse.json());
+        }
+
+        setResults((prev) => {
+          const savedIds = new Set(savedInvoices.map((invoice) => invoice.id));
+          return [...savedInvoices, ...prev.filter((invoice) => !savedIds.has(invoice.id))];
+        });
+        await loadProducts();
+        setSelectedFile(null);
+        setProgress(100);
+        setTimeout(() => {
+          setIsLoading(false);
+          setProgress(0);
+          setLoadingPhase("");
+        }, 500);
+        return;
+      }
       
       setProgress(85);
       setLoadingPhase("Validando datos...");
@@ -442,6 +474,7 @@ export default function App() {
         id: crypto.randomUUID(),
         fileName: selectedFile.name,
         source: isXml ? "SRI_RECEIVED" : "AI_UPLOAD",
+        category: isXml ? "INVENTARIO" : "REVISION",
         supplier: rawData.supplier || "Desconocido",
         supplierRuc: rawData.supplierRuc || "",
         invoiceNumber: rawData.invoiceNumber || "",
@@ -473,6 +506,7 @@ export default function App() {
 
       const savedResult = await saveResponse.json();
       setResults(prev => [savedResult, ...prev.filter(r => r.id !== savedResult.id)]);
+      await loadProducts();
       setSelectedFile(null);
       setProgress(100);
       
@@ -490,187 +524,6 @@ export default function App() {
     }
   };
 
-  const loginSri = async () => {
-    setIsSriLoggingIn(true);
-    setError(null);
-    setSriBulkSummary(null);
-
-    try {
-      const response = await fetch("/api/sri/session", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ruc: sriRuc,
-          username: sriUsername || sriRuc,
-          password: sriPassword,
-        }),
-      });
-
-      if (!response.ok) {
-        const payload = await response.json().catch(() => null);
-        throw new Error(payload?.error || "No se pudo iniciar sesion SRI.");
-      }
-
-      const session = await response.json();
-      setSriSession(session);
-      setSriRuc(session.ruc);
-      setSriUsername(session.username);
-      setSriPassword("");
-      window.sessionStorage.setItem("facturas-ai:sri-session", JSON.stringify(session));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "No se pudo iniciar sesion SRI.");
-    } finally {
-      setIsSriLoggingIn(false);
-    }
-  };
-
-  const logoutSri = async () => {
-    const sessionId = sriSession?.id;
-    setSriSession(null);
-    setSriPassword("");
-    setSriBulkSummary(null);
-    window.sessionStorage.removeItem("facturas-ai:sri-session");
-
-    if (!sessionId) return;
-
-    await fetch("/api/sri/session", {
-      method: "DELETE",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionId }),
-    }).catch(() => null);
-  };
-
-  const importSriPeriod = async () => {
-    if (!sriSession) {
-      setError("Inicia sesion SRI antes de importar por periodo.");
-      return;
-    }
-
-    setIsSriPeriodImporting(true);
-    setError(null);
-    setSriBulkSummary(null);
-
-    try {
-      const response = await fetch("/api/sri/received-period", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sessionId: sriSession.id,
-          year: Number(sriPeriodYear),
-          month: Number(sriPeriodMonth),
-          day: Number(sriPeriodDay),
-          voucherType: sriVoucherType,
-          environment: "production",
-        }),
-      });
-
-      const payload = await response.json().catch(() => null);
-      if (!response.ok) {
-        throw new Error(payload?.error || "No se pudo importar el periodo SRI.");
-      }
-
-      const imported = Array.isArray(payload.imported) ? payload.imported as InvoiceResult[] : [];
-      setResults((prev) => {
-        const importedIds = new Set(imported.map((invoice) => invoice.id));
-        return [...imported, ...prev.filter((invoice) => !importedIds.has(invoice.id))];
-      });
-      setSriBulkSummary(payload.summary || null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "No se pudo importar el periodo SRI.");
-    } finally {
-      setIsSriPeriodImporting(false);
-    }
-  };
-
-  const copySriBrowserConnector = async () => {
-    const endpoint = `${window.location.origin}/api/sri/import-xml-batch`;
-    const connector = `javascript:(async()=>{const endpoint=${JSON.stringify(endpoint)};const form=document.querySelector('form');if(!form){alert('No se encontro formulario del SRI. Abre Comprobantes recibidos y consulta un periodo.');return;}const links=[...document.querySelectorAll('[id*=\"tablaCompRecibidos\"][id$=\"lnkXml\"],[name*=\"tablaCompRecibidos\"][name$=\"lnkXml\"]')];if(!links.length){alert('No se encontraron enlaces XML. Primero consulta el periodo en Comprobantes recibidos.');return;}const xmlTexts=[];for(const link of links.slice(0,150)){const id=link.id||link.name;const body=new URLSearchParams(new FormData(form));body.set(form.id||form.name,form.id||form.name);body.set(id,id);const response=await fetch(form.action||location.href,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},credentials:'include',body});xmlTexts.push(await response.text());}const result=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({xmlTexts})});const payload=await result.json();if(!result.ok){alert(payload.error||'No se pudo enviar a Facturas AI');return;}alert('Facturas AI: '+(payload.summary?.imported||0)+' importadas, '+(payload.summary?.failed||0)+' con error.');})();`;
-
-    try {
-      await navigator.clipboard.writeText(connector);
-      setError("Conector copiado. Pegalo como URL en un marcador del navegador y ejecutalo dentro de la pantalla Comprobantes recibidos del SRI.");
-    } catch {
-      setError("No se pudo copiar el conector. Permite acceso al portapapeles e intenta otra vez.");
-    }
-  };
-
-  const consultSriByAccessKey = async () => {
-    const cleanAccessKey = sriAccessKey.replace(/\D/g, "");
-    if (cleanAccessKey.length !== 49) {
-      setError("La clave de acceso SRI debe tener 49 digitos.");
-      return;
-    }
-
-    setIsSriSyncing(true);
-    setError(null);
-
-    try {
-      const response = await fetch("/api/sri/authorization", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ accessKey: cleanAccessKey, environment: "production" }),
-      });
-
-      if (!response.ok) {
-        const payload = await response.json().catch(() => null);
-        throw new Error(payload?.error || "No se pudo consultar el SRI.");
-      }
-
-      const rawData = await response.json();
-      if (rawData.sriAuthorizationStatus && rawData.sriAuthorizationStatus !== "AUTORIZADO") {
-        throw new Error(`SRI: ${rawData.sriAuthorizationStatus}. ${(rawData.notes || []).join(" ")}`);
-      }
-
-      const sanitizedItems = sanitizeItems(rawData.items || []);
-      const invoiceTotalPaid = roundMoney(asFiniteNumber(rawData.invoiceTotalPaid));
-      const totalItems = sumItems(sanitizedItems);
-      const difference = roundMoney(invoiceTotalPaid - totalItems);
-      const notes = Array.isArray(rawData.notes) ? rawData.notes.map(String) : [];
-
-      if (Math.abs(difference) > 0.01) {
-        notes.push(`Diferencia por revisar: factura ${invoiceTotalPaid.toFixed(2)} vs items ${totalItems.toFixed(2)}.`);
-      }
-
-      const newResult: InvoiceResult = {
-        id: crypto.randomUUID(),
-        fileName: `${cleanAccessKey}.xml`,
-        source: "SRI_RECEIVED",
-        supplier: rawData.supplier || "Desconocido",
-        supplierRuc: rawData.supplierRuc || "",
-        invoiceNumber: rawData.invoiceNumber || "",
-        invoiceDate: rawData.invoiceDate || "",
-        accessKey: cleanAccessKey,
-        authorizationDate: rawData.authorizationDate || "",
-        sriReceptionStatus: sriReceptionStatus(sanitizedItems, difference),
-        invoiceTotalPaid,
-        currency: "USD",
-        items: sanitizedItems,
-        status: sanitizedItems.length > 0 && Math.abs(difference) <= 0.01 ? "OK" : "REVIEW",
-        difference,
-        notes,
-      };
-
-      const saveResponse = await fetch("/api/invoices", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(newResult),
-      });
-
-      if (!saveResponse.ok) {
-        const payload = await saveResponse.json().catch(() => null);
-        throw new Error(payload?.error || "La factura se consulto, pero no se pudo guardar.");
-      }
-
-      const savedResult = await saveResponse.json();
-      setResults((prev) => [savedResult, ...prev.filter((invoice) => invoice.id !== savedResult.id)]);
-      setSriAccessKey("");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "No se pudo consultar el SRI.");
-    } finally {
-      setIsSriSyncing(false);
-    }
-  };
-
   const normalize = (str: string) => 
     str.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
 
@@ -682,7 +535,11 @@ export default function App() {
   };
 
   const filteredRows = useMemo(() => {
-    let allRows = results.flatMap(invoice => 
+    const visibleInvoices = categoryFilter === "TODAS"
+      ? results
+      : results.filter((invoice) => (invoice.category || "SIN_CATEGORIA") === categoryFilter);
+
+    let allRows = visibleInvoices.flatMap(invoice => 
       invoice.items.map((item, idx) => ({ 
         ...item, 
         supplier: invoice.supplier, 
@@ -729,7 +586,7 @@ export default function App() {
     }
     
     return allRows;
-  }, [results, searchQuery, sortField, sortOrder, columnSearch]);
+  }, [results, searchQuery, sortField, sortOrder, columnSearch, categoryFilter]);
 
   const totalInvoiceSum = useMemo(() => 
     roundMoney(filteredRows.reduce((acc, curr) => acc + curr.finalTotalCost, 0)), 
@@ -762,8 +619,13 @@ export default function App() {
   }, [aggType]);
 
   const sriInvoices = useMemo(
-    () => results.filter((invoice) => invoice.source === "SRI_RECEIVED" || invoice.fileName.toLowerCase().endsWith(".xml")),
-    [results],
+    () => {
+      const sourceInvoices = results.filter((invoice) => invoice.source === "SRI_RECEIVED" || invoice.fileName.toLowerCase().endsWith(".xml"));
+      return categoryFilter === "TODAS"
+        ? sourceInvoices
+        : sourceInvoices.filter((invoice) => (invoice.category || "SIN_CATEGORIA") === categoryFilter);
+    },
+    [results, categoryFilter],
   );
 
   const sriReady = sriInvoices.filter((invoice) => invoice.sriReceptionStatus === "Listo para ingresar").length;
@@ -773,6 +635,28 @@ export default function App() {
     (acc, invoice) => acc + invoice.items.filter((item) => !item.barcode).length,
     0,
   );
+
+  const updateInvoiceCategory = async (invoice: InvoiceResult, category: InvoiceCategory) => {
+    const updatedInvoice = { ...invoice, category };
+    setResults((prev) => prev.map((item) => (item.id === invoice.id ? updatedInvoice : item)));
+
+    try {
+      const response = await fetch("/api/invoices", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(updatedInvoice),
+      });
+
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        throw new Error(payload?.error || "No se pudo guardar la categoria.");
+      }
+      await loadProducts();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "No se pudo guardar la categoria.");
+      setResults((prev) => prev.map((item) => (item.id === invoice.id ? invoice : item)));
+    }
+  };
 
   const exportCSV = () => {
     const headers = ["Fecha", "Proveedor", "RUC", "Factura", "Clave acceso", "Producto", "Codigo", "Cantidad", "Precio Unit", "Total", "IVA", "Archivo"];
@@ -928,14 +812,14 @@ export default function App() {
                 type="file" 
                 className="hidden" 
                 onChange={(e) => handleFileUpload(e.target.files)}
-                accept="image/*,.pdf,.xml,text/xml,application/xml"
+                accept="image/*,.pdf,.xml,.txt,text/plain,text/xml,application/xml"
               />
               <div className="bg-slate-800 p-4 rounded-full mb-4 group-hover:scale-110 transition-transform">
                 <Upload className="h-6 w-6 text-cyan-400" />
               </div>
               <p className="font-black text-slate-200 text-sm uppercase tracking-wide">Subir comprobantes</p>
               <p className="text-[10px] text-slate-500 mt-1 uppercase font-bold tracking-tight">
-                Fotos, capturas, PDF o <span className="text-cyan-500 underline decoration-cyan-500/30 underline-offset-2">Pega una imagen (Ctrl+V o Click derecho)</span>
+                XML, reporte TXT SRI, fotos, PDF o <span className="text-cyan-500 underline decoration-cyan-500/30 underline-offset-2">pega una imagen</span>
               </p>
               
               {selectedFile && (
@@ -1025,20 +909,20 @@ export default function App() {
             <section className="border-b border-slate-800/60 bg-slate-950/30 p-4 space-y-4">
               <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
                 <div>
-                  <div className="text-[10px] font-black uppercase tracking-[0.3em] text-cyan-500">Recepcion SRI</div>
-                  <h2 className="text-lg font-black uppercase tracking-tight text-white">Facturas recibidas</h2>
+                  <div className="text-[10px] font-black uppercase tracking-[0.3em] text-cyan-500">Archivo SRI</div>
+                  <h2 className="text-lg font-black uppercase tracking-tight text-white">Facturas y productos</h2>
                 </div>
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[10px] font-black uppercase">
                   <div className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-2">
-                    <span className="block text-slate-600">XML</span>
+                    <span className="block text-slate-600">Facturas</span>
                     <strong className="text-slate-200">{sriInvoices.length}</strong>
                   </div>
                   <div className="rounded-lg border border-green-500/20 bg-green-500/10 px-3 py-2">
-                    <span className="block text-green-600">Listas</span>
-                    <strong className="text-green-400">{sriReady}</strong>
+                    <span className="block text-green-600">Productos</span>
+                    <strong className="text-green-400">{products.length}</strong>
                   </div>
                   <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2">
-                    <span className="block text-amber-600">Mapeo</span>
+                    <span className="block text-amber-600">Revision</span>
                     <strong className="text-amber-400">{sriPending}</strong>
                   </div>
                   <div className="rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-3 py-2">
@@ -1049,9 +933,9 @@ export default function App() {
               </div>
 
               <div className="grid gap-2 md:grid-cols-4">
-                {["Consultar SRI", "Validar XML", "Mapear productos", "Ingresar compra"].map((step, index) => (
+                {["Subir TXT/XML", "Clasificar", "Revisar productos", "Guardar historial"].map((step, index) => (
                   <div key={step} className="flex items-center gap-2 rounded-lg border border-slate-800 bg-slate-900/50 px-3 py-2">
-                    <div className={`flex h-6 w-6 items-center justify-center rounded-full text-[10px] font-black ${index < 2 ? "bg-cyan-500/20 text-cyan-400" : "bg-slate-800 text-slate-500"}`}>
+                    <div className={`flex h-6 w-6 items-center justify-center rounded-full text-[10px] font-black ${index < 3 ? "bg-cyan-500/20 text-cyan-400" : "bg-slate-800 text-slate-500"}`}>
                       {index + 1}
                     </div>
                     <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">{step}</span>
@@ -1060,185 +944,55 @@ export default function App() {
               </div>
 
               <div className="grid gap-3 rounded-xl border border-slate-800 bg-slate-950/40 p-4">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="flex min-w-0 items-center gap-2">
-                    <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border ${sriSession ? "border-green-500/30 bg-green-500/10 text-green-400" : "border-slate-800 bg-slate-900 text-slate-500"}`}>
-                      {sriSession ? <ShieldCheck className="h-4 w-4" /> : <KeyRound className="h-4 w-4" />}
-                    </div>
-                    <div className="min-w-0">
-                      <div className="text-[10px] font-black uppercase tracking-[0.25em] text-slate-500">Sesion SRI</div>
-                      <div className="truncate text-xs font-black uppercase text-slate-200">
-                        {sriSession ? `${sriSession.ruc} conectado` : "Conecta tu usuario SRI"}
-                      </div>
-                    </div>
+                <div className="grid gap-3 md:grid-cols-[1fr_auto]">
+                  <div>
+                    <div className="text-[10px] font-black uppercase tracking-[0.25em] text-slate-500">Reporte TXT SRI</div>
+                    <p className="mt-1 text-xs font-bold text-slate-300">
+                      Descarga el reporte TXT desde el SRI y subelo como archivo. Las facturas se guardan en Revision; al subir XML, foto o PDF se guardan tambien sus productos y ultimo costo.
+                    </p>
                   </div>
-                  {sriSession && (
-                    <button
-                      onClick={logoutSri}
-                      className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-800 bg-slate-900 text-slate-500 transition hover:text-red-300"
-                      title="Cerrar sesion SRI"
-                    >
-                      <LogOut className="h-4 w-4" />
-                    </button>
-                  )}
+                  <select
+                    value={categoryFilter}
+                    onChange={(event) => setCategoryFilter(event.target.value as InvoiceCategory | "TODAS")}
+                    className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-3 text-[11px] font-black uppercase text-slate-200 outline-none transition focus:border-cyan-500/40"
+                  >
+                    <option value="TODAS">Todas</option>
+                    {CATEGORY_OPTIONS.map((category) => (
+                      <option key={category.value} value={category.value}>{category.label}</option>
+                    ))}
+                  </select>
                 </div>
-
-                {!sriSession ? (
-                  <div className="grid gap-2 md:grid-cols-[1fr_1fr_1fr_auto]">
-                    <input
-                      value={sriRuc}
-                      onChange={(event) => {
-                        const value = event.target.value.replace(/\D/g, "").slice(0, 13);
-                        setSriRuc(value);
-                        if (!sriUsername || sriUsername === sriRuc) setSriUsername(value);
-                      }}
-                      inputMode="numeric"
-                      maxLength={13}
-                      placeholder="RUC"
-                      className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-3 font-mono text-[11px] font-bold text-slate-200 outline-none transition focus:border-cyan-500/40 placeholder:text-slate-700"
-                    />
-                    <input
-                      value={sriUsername}
-                      onChange={(event) => setSriUsername(event.target.value.replace(/\D/g, "").slice(0, 13))}
-                      inputMode="numeric"
-                      maxLength={13}
-                      placeholder="USUARIO SRI"
-                      className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-3 font-mono text-[11px] font-bold text-slate-200 outline-none transition focus:border-cyan-500/40 placeholder:text-slate-700"
-                    />
-                    <input
-                      value={sriPassword}
-                      onChange={(event) => setSriPassword(event.target.value)}
-                      type="password"
-                      placeholder="CLAVE SRI"
-                      className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-3 text-[11px] font-bold text-slate-200 outline-none transition focus:border-cyan-500/40 placeholder:text-slate-700"
-                    />
-                    <button
-                      onClick={loginSri}
-                      disabled={isSriLoggingIn}
-                      className="flex items-center justify-center gap-2 rounded-lg bg-green-600 px-4 py-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-green-500 disabled:opacity-40"
-                    >
-                      {isSriLoggingIn ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <LogIn className="h-3.5 w-3.5" />}
-                      Conectar
-                    </button>
-                  </div>
-                ) : (
-                  <div className="grid gap-3">
-                    <div className="grid gap-2 md:grid-cols-[0.8fr_0.9fr_0.9fr_1.4fr_auto]">
-                      <select
-                        value={sriPeriodYear}
-                        onChange={(event) => setSriPeriodYear(event.target.value)}
-                        className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-3 text-[11px] font-black uppercase text-slate-200 outline-none transition focus:border-cyan-500/40"
-                      >
-                        {Array.from({ length: 8 }, (_, index) => new Date().getFullYear() - index).map((year) => (
-                          <option key={year} value={year}>{year}</option>
-                        ))}
-                      </select>
-                      <select
-                        value={sriPeriodMonth}
-                        onChange={(event) => setSriPeriodMonth(event.target.value)}
-                        className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-3 text-[11px] font-black uppercase text-slate-200 outline-none transition focus:border-cyan-500/40"
-                      >
-                        {[
-                          ["01", "Enero"], ["02", "Febrero"], ["03", "Marzo"], ["04", "Abril"],
-                          ["05", "Mayo"], ["06", "Junio"], ["07", "Julio"], ["08", "Agosto"],
-                          ["09", "Septiembre"], ["10", "Octubre"], ["11", "Noviembre"], ["12", "Diciembre"],
-                        ].map(([value, label]) => (
-                          <option key={value} value={value}>{label}</option>
-                        ))}
-                      </select>
-                      <select
-                        value={sriPeriodDay}
-                        onChange={(event) => setSriPeriodDay(event.target.value)}
-                        className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-3 text-[11px] font-black uppercase text-slate-200 outline-none transition focus:border-cyan-500/40"
-                      >
-                        <option value="0">Todo el mes</option>
-                        {Array.from({ length: 31 }, (_, index) => String(index + 1)).map((day) => (
-                          <option key={day} value={day}>{`Dia ${day}`}</option>
-                        ))}
-                      </select>
-                      <select
-                        value={sriVoucherType}
-                        onChange={(event) => setSriVoucherType(event.target.value as SriVoucherType)}
-                        className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-3 text-[11px] font-black uppercase text-slate-200 outline-none transition focus:border-cyan-500/40"
-                      >
-                        <option value="0">Factura</option>
-                        <option value="1">Todos</option>
-                        <option value="2">Liquidacion compra</option>
-                        <option value="3">Nota credito</option>
-                        <option value="4">Nota debito</option>
-                        <option value="6">Retencion</option>
-                      </select>
-                      <button
-                        onClick={importSriPeriod}
-                        disabled={isSriPeriodImporting}
-                        className="flex items-center justify-center gap-2 rounded-lg bg-cyan-600 px-4 py-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-cyan-500 disabled:opacity-40"
-                      >
-                        {isSriPeriodImporting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CalendarDays className="h-3.5 w-3.5" />}
-                        {isSriPeriodImporting ? "Importando..." : "Importar periodo"}
-                      </button>
-                    </div>
-                    <div className="flex items-center justify-between gap-3 rounded-lg border border-slate-800 bg-slate-950/70 px-3 py-2">
-                      <span className="text-[10px] font-bold uppercase tracking-widest text-slate-600">
-                        {sriBulkSummary
-                          ? `${sriBulkSummary.imported}/${sriBulkSummary.requested} importados, ${sriBulkSummary.failed} con error`
-                          : "Importacion directa de comprobantes recibidos por periodo SRI"}
-                      </span>
-                      <RefreshCw className="h-3.5 w-3.5 shrink-0 text-slate-600" />
-                    </div>
-                    <button
-                      onClick={copySriBrowserConnector}
-                      className="flex items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-4 py-3 text-[10px] font-black uppercase tracking-widest text-slate-300 transition hover:border-cyan-500/40 hover:text-cyan-300"
-                    >
-                      <Copy className="h-3.5 w-3.5" />
-                      Copiar conector navegador SRI
-                    </button>
-                  </div>
-                )}
-              </div>
-
-              <div className="grid gap-2 md:grid-cols-[1fr_auto]">
-                <input
-                  value={sriAccessKey}
-                  onChange={(event) => setSriAccessKey(event.target.value)}
-                  inputMode="numeric"
-                  maxLength={60}
-                  placeholder="CLAVE DE ACCESO SRI (49 DIGITOS)"
-                  className="rounded-xl border border-slate-800 bg-slate-950/70 px-4 py-3 font-mono text-[11px] font-bold tracking-wider text-slate-200 outline-none transition focus:border-cyan-500/40 placeholder:text-slate-700"
-                />
-                <button
-                  onClick={consultSriByAccessKey}
-                  disabled={isSriSyncing}
-                  className="rounded-xl bg-cyan-600 px-5 py-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-cyan-500 disabled:opacity-40"
-                >
-                  {isSriSyncing ? "Consultando..." : "Consultar SRI"}
-                </button>
               </div>
 
               <div className="rounded-xl border border-slate-800 overflow-hidden">
-                <div className="grid grid-cols-[1.2fr_1fr_0.8fr_0.8fr] gap-2 bg-slate-950 px-4 py-2 text-[9px] font-black uppercase tracking-widest text-slate-600">
+                <div className="grid grid-cols-[1.2fr_0.8fr_0.8fr_0.8fr] gap-2 bg-slate-950 px-4 py-2 text-[9px] font-black uppercase tracking-widest text-slate-600">
                   <span>Proveedor</span>
-                  <span>Clave acceso</span>
-                  <span>Estado</span>
+                  <span>Categoria</span>
+                  <span>Productos</span>
                   <span className="text-right">Total</span>
                 </div>
                 <div className="max-h-52 overflow-auto custom-scrollbar divide-y divide-slate-800">
                   {sriInvoices.length === 0 ? (
                     <div className="px-4 py-8 text-center text-[10px] font-black uppercase tracking-widest text-slate-700">
-                      Sube XML autorizados del SRI para alimentar este modulo
+                      Sube reporte TXT, XML, foto o PDF para alimentar este modulo
                     </div>
                   ) : (
                     sriInvoices.slice(0, 6).map((invoice) => (
-                      <div key={invoice.id} className="grid grid-cols-[1.2fr_1fr_0.8fr_0.8fr] gap-2 px-4 py-3 text-[11px]">
+                      <div key={invoice.id} className="grid grid-cols-[1.2fr_0.8fr_0.8fr_0.8fr] gap-2 px-4 py-3 text-[11px]">
                         <div>
                           <strong className="block text-slate-200 uppercase">{invoice.supplier || "Proveedor"}</strong>
                           <span className="text-slate-600">{invoice.supplierRuc || invoice.invoiceNumber || "Sin RUC"}</span>
                         </div>
-                        <span className="truncate font-mono text-[9px] text-slate-500" title={invoice.accessKey || ""}>
-                          {invoice.accessKey || "Pendiente"}
-                        </span>
-                        <span className={`w-fit rounded-full px-2 py-1 text-[9px] font-black uppercase ${invoice.sriReceptionStatus === "Listo para ingresar" ? "bg-green-500/10 text-green-400" : "bg-amber-500/10 text-amber-400"}`}>
-                          {invoice.sriReceptionStatus || "Pendiente mapeo"}
-                        </span>
+                        <select
+                          value={invoice.category || "SIN_CATEGORIA"}
+                          onChange={(event) => updateInvoiceCategory(invoice, event.target.value as InvoiceCategory)}
+                          className="w-full rounded border border-slate-800 bg-slate-950 px-2 py-1 text-[9px] font-black uppercase text-slate-300 outline-none"
+                        >
+                          {CATEGORY_OPTIONS.map((category) => (
+                            <option key={category.value} value={category.value}>{category.label}</option>
+                          ))}
+                        </select>
+                        <span className="text-slate-400">{invoice.items.length}</span>
                         <strong className="text-right text-cyan-400">${invoice.invoiceTotalPaid.toFixed(2)}</strong>
                       </div>
                     ))
@@ -1251,6 +1005,34 @@ export default function App() {
                   {sriUnmappedItems} productos recibidos no tienen codigo de barras y requieren mapeo antes de ingresar inventario.
                 </div>
               )}
+
+              <div className="rounded-xl border border-slate-800 overflow-hidden">
+                <div className="grid grid-cols-[1.4fr_0.8fr_0.7fr_0.8fr] gap-2 bg-slate-950 px-4 py-2 text-[9px] font-black uppercase tracking-widest text-slate-600">
+                  <span>Producto</span>
+                  <span>Proveedor</span>
+                  <span className="text-right">Ult. costo</span>
+                  <span className="text-right">Compras</span>
+                </div>
+                <div className="max-h-44 overflow-auto custom-scrollbar divide-y divide-slate-800">
+                  {products.length === 0 ? (
+                    <div className="px-4 py-6 text-center text-[10px] font-black uppercase tracking-widest text-slate-700">
+                      Los productos apareceran al subir XML, foto o PDF con detalle
+                    </div>
+                  ) : (
+                    products.slice(0, 8).map((product) => (
+                      <div key={product.id} className="grid grid-cols-[1.4fr_0.8fr_0.7fr_0.8fr] gap-2 px-4 py-3 text-[11px]">
+                        <div>
+                          <strong className="block truncate text-slate-200 uppercase">{product.product}</strong>
+                          <span className="font-mono text-[9px] text-slate-600">{product.barcode || "Sin codigo"}</span>
+                        </div>
+                        <span className="truncate text-slate-500">{product.supplier || "Proveedor"}</span>
+                        <strong className="text-right text-cyan-400">${Number(product.lastUnitCost || 0).toFixed(4)}</strong>
+                        <span className="text-right text-slate-400">{product.purchaseCount}</span>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
             </section>
 
             {/* Search and Export */}
