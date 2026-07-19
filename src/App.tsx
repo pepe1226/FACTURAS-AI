@@ -131,6 +131,10 @@ function roundMoney(value: number): number {
   return Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 }
 
+function roundUnitCost(value: number): number {
+  return Math.round((Number(value || 0) + Number.EPSILON) * 10000) / 10000;
+}
+
 function sumItems(items: InvoiceItem[]): number {
   return roundMoney(items.reduce((acc, item) => acc + Number(item.finalTotalCost || 0), 0));
 }
@@ -618,7 +622,7 @@ export default function App() {
     [filteredRows],
   );
   const weightedUnitCost = useMemo(
-    () => totalFilteredQuantity > 0 ? roundMoney(totalInvoiceSum / totalFilteredQuantity) : 0,
+    () => totalFilteredQuantity > 0 ? roundUnitCost(totalInvoiceSum / totalFilteredQuantity) : 0,
     [totalFilteredQuantity, totalInvoiceSum],
   );
 
@@ -1471,7 +1475,7 @@ export default function App() {
                       >
                         <div className="flex items-center justify-end gap-2">
                           <Sigma className="h-3 w-3" />
-                          <span className="tabular-nums">${aggResult.toFixed(2)}</span>
+                          <span className="tabular-nums">${aggType === "avg" ? aggResult.toFixed(4) : aggResult.toFixed(2)}</span>
                         </div>
                       </td>
                       <td className="px-6 py-4"></td>
