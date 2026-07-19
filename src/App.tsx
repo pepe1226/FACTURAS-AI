@@ -28,7 +28,9 @@ import {
   LogOut,
   ShieldCheck,
   RefreshCw,
-  CalendarDays
+  CalendarDays,
+  Archive,
+  ClipboardList
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 
@@ -248,7 +250,10 @@ async function optimizeImage(base64: string, maxDimension = 2048): Promise<strin
 export default function App() {
   const [results, setResults] = useState<InvoiceResult[]>([]);
   const [products, setProducts] = useState<ProductPurchaseInfo[]>([]);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [selectedInvoiceIds, setSelectedInvoiceIds] = useState<Set<string>>(new Set());
+  const [loadedInvoiceIds, setLoadedInvoiceIds] = useState<Set<string>>(new Set());
+  const [showOnlySelectedUploads, setShowOnlySelectedUploads] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [progress, setProgress] = useState(0);
   const [loadingPhase, setLoadingPhase] = useState("");
@@ -317,7 +322,7 @@ export default function App() {
           if (type.startsWith("image/")) {
             const blob = await item.getType(type);
             const file = new File([blob], `pasted-image-${Date.now()}.png`, { type });
-            setSelectedFile(file);
+            setSelectedFiles((prev) => [...prev, file]);
             setError(null);
             foundImage = true;
             break;
@@ -343,7 +348,7 @@ export default function App() {
 
   const handleFileUpload = (files: FileList | null) => {
     if (!files || files.length === 0) return;
-    setSelectedFile(files[0]);
+    setSelectedFiles((prev) => [...prev, ...Array.from(files)]);
     setError(null);
   };
 
@@ -357,7 +362,7 @@ export default function App() {
           const blob = items[i].getAsFile();
           if (blob) {
             const file = new File([blob], `pasted-image-${Date.now()}.png`, { type: blob.type });
-            setSelectedFile(file);
+            setSelectedFiles((prev) => [...prev, file]);
             setError(null);
           }
         }
@@ -368,155 +373,168 @@ export default function App() {
     return () => window.removeEventListener("paste", handlePaste);
   }, []);
 
-  const processFile = async () => {
-    if (!selectedFile) return;
-    
-    setIsLoading(true);
-    setProgress(5);
-    setLoadingPhase("Leyendo archivo...");
-    setError(null);
+  const processSingleFile = async (file: File, index: number, total: number): Promise<InvoiceResult[]> => {
+    const baseProgress = Math.round((index / total) * 100);
+    const stepProgress = (step: number) => Math.min(99, baseProgress + Math.round(step / total));
 
-    try {
-      const initialBase64 = await fileToBase64(selectedFile);
-      setProgress(15);
-      
-      let base64 = initialBase64;
-      const isXml = selectedFile.type.includes("xml") || selectedFile.name.toLowerCase().endsWith(".xml");
-      const isTxt = selectedFile.type.includes("text/plain") || selectedFile.name.toLowerCase().endsWith(".txt");
-      
-      if (selectedFile.type.startsWith("image/")) {
-        setLoadingPhase("Optimizando imagen...");
+    setProgress(stepProgress(5));
+    setLoadingPhase(`Leyendo ${index + 1}/${total}: ${file.name}`);
+
+    const isXml = file.type.includes("xml") || file.name.toLowerCase().endsWith(".xml");
+    const isTxt = file.type.includes("text/plain") || file.name.toLowerCase().endsWith(".txt");
+    let base64 = "";
+
+    if (!isXml && !isTxt) {
+      const initialBase64 = await fileToBase64(file);
+      base64 = initialBase64;
+
+      if (file.type.startsWith("image/")) {
+        setLoadingPhase(`Optimizando imagen ${index + 1}/${total}...`);
         try {
           base64 = await optimizeImage(initialBase64);
         } catch (e) {
           console.warn("Resizing failed, using original", e);
         }
-      } else if (isXml) {
-        setLoadingPhase("Leyendo XML...");
-      } else if (isTxt) {
-        setLoadingPhase("Leyendo reporte TXT SRI...");
       } else {
-        setLoadingPhase("Preparando documento...");
+        setLoadingPhase(`Preparando documento ${index + 1}/${total}...`);
       }
+    } else {
+      setLoadingPhase(isXml ? `Leyendo XML ${index + 1}/${total}...` : `Leyendo reporte TXT ${index + 1}/${total}...`);
+    }
 
-      setProgress(25);
-      setLoadingPhase(isXml || isTxt ? "Leyendo datos estructurados..." : "Analizando con lector visual...");
-      
-      const response = await fetch("/api/extract-invoice", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          fileName: selectedFile.name,
-          mimeType: selectedFile.type || (isXml ? "application/xml" : isTxt ? "text/plain" : "image/jpeg"),
-          data: isXml || isTxt ? undefined : base64,
-          xmlText: isXml ? await selectedFile.text() : undefined,
-          text: isTxt ? await selectedFile.text() : undefined,
-        }),
-      });
+    setProgress(stepProgress(25));
+    setLoadingPhase(isXml || isTxt ? "Leyendo datos estructurados..." : "Analizando con lector visual...");
 
-      if (!response.ok) {
-        const payload = await response.json().catch(() => null);
-        throw new Error(payload?.error || "No se pudo analizar la factura.");
-      }
+    const response = await fetch("/api/extract-invoice", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fileName: file.name,
+        mimeType: file.type || (isXml ? "application/xml" : isTxt ? "text/plain" : "image/jpeg"),
+        data: isXml || isTxt ? undefined : base64,
+        xmlText: isXml ? await file.text() : undefined,
+        text: isTxt ? await file.text() : undefined,
+      }),
+    });
 
-      setProgress(70);
-      setLoadingPhase("Procesando respuesta...");
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      throw new Error(payload?.error || "No se pudo analizar la factura.");
+    }
 
-      const rawData = await response.json();
-      if (Array.isArray(rawData.reportInvoices)) {
-        setProgress(80);
-        setLoadingPhase("Guardando reporte TXT...");
-        const savedInvoices: InvoiceResult[] = [];
+    setProgress(stepProgress(70));
+    setLoadingPhase("Guardando facturas...");
 
-        for (const reportInvoice of rawData.reportInvoices as InvoiceResult[]) {
-          const saveResponse = await fetch("/api/invoices", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(reportInvoice),
-          });
+    const rawData = await response.json();
+    if (Array.isArray(rawData.reportInvoices)) {
+      const savedInvoices: InvoiceResult[] = [];
 
-          if (!saveResponse.ok) {
-            const payload = await saveResponse.json().catch(() => null);
-            throw new Error(payload?.error || "No se pudo guardar una factura del reporte TXT.");
-          }
+      for (const reportInvoice of rawData.reportInvoices as InvoiceResult[]) {
+        const saveResponse = await fetch("/api/invoices", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(reportInvoice),
+        });
 
-          savedInvoices.push(await saveResponse.json());
+        if (!saveResponse.ok) {
+          const payload = await saveResponse.json().catch(() => null);
+          throw new Error(payload?.error || "No se pudo guardar una factura del reporte TXT.");
         }
 
+        savedInvoices.push(await saveResponse.json());
+      }
+
+      return savedInvoices;
+    }
+
+    const sanitizedItems = sanitizeItems(rawData.items || []);
+    const invoiceTotalPaid = roundMoney(asFiniteNumber(rawData.invoiceTotalPaid));
+    const totalItems = sumItems(sanitizedItems);
+    const difference = roundMoney(invoiceTotalPaid - totalItems);
+    const notes = Array.isArray(rawData.notes) ? rawData.notes.map(String) : [];
+
+    if (Math.abs(difference) > 0.01) {
+      notes.push(`Diferencia por revisar: factura ${invoiceTotalPaid.toFixed(2)} vs items ${totalItems.toFixed(2)}.`);
+    }
+
+    const newResult: InvoiceResult = {
+      id: crypto.randomUUID(),
+      fileName: file.name,
+      source: isXml ? "SRI_RECEIVED" : "AI_UPLOAD",
+      category: isXml ? "INVENTARIO" : "REVISION",
+      supplier: rawData.supplier || "Desconocido",
+      supplierRuc: rawData.supplierRuc || "",
+      invoiceNumber: rawData.invoiceNumber || "",
+      invoiceDate: rawData.invoiceDate || "",
+      accessKey: rawData.accessKey || "",
+      authorizationDate: rawData.authorizationDate || "",
+      sriReceptionStatus: isXml ? sriReceptionStatus(sanitizedItems, difference) : undefined,
+      invoiceTotalPaid,
+      currency: "USD",
+      items: sanitizedItems,
+      status: sanitizedItems.length > 0 && Math.abs(difference) <= 0.01 ? "OK" : "REVIEW",
+      difference,
+      notes,
+    };
+
+    const saveResponse = await fetch("/api/invoices", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(newResult),
+    });
+
+    if (!saveResponse.ok) {
+      const payload = await saveResponse.json().catch(() => null);
+      throw new Error(payload?.error || "La factura se extrajo, pero no se pudo guardar.");
+    }
+
+    return [await saveResponse.json()];
+  };
+
+  const processFiles = async () => {
+    if (selectedFiles.length === 0) return;
+
+    setIsLoading(true);
+    setProgress(5);
+    setError(null);
+
+    const savedInvoices: InvoiceResult[] = [];
+    const failedFiles: string[] = [];
+
+    try {
+      for (const [index, file] of selectedFiles.entries()) {
+        try {
+          savedInvoices.push(...await processSingleFile(file, index, selectedFiles.length));
+        } catch (err) {
+          console.error("Error processing file:", file.name, err);
+          failedFiles.push(`${file.name}: ${friendlyProcessingError(err)}`);
+        }
+      }
+
+      if (savedInvoices.length > 0) {
         setResults((prev) => {
           const savedIds = new Set(savedInvoices.map((invoice) => invoice.id));
           return [...savedInvoices, ...prev.filter((invoice) => !savedIds.has(invoice.id))];
         });
+        setSelectedInvoiceIds(new Set(savedInvoices.map((invoice) => invoice.id)));
         await loadProducts();
-        setSelectedFile(null);
-        setProgress(100);
-        setTimeout(() => {
-          setIsLoading(false);
-          setProgress(0);
-          setLoadingPhase("");
-        }, 500);
-        return;
-      }
-      
-      setProgress(85);
-      setLoadingPhase("Validando datos...");
-
-      const sanitizedItems = sanitizeItems(rawData.items || []);
-      const invoiceTotalPaid = roundMoney(asFiniteNumber(rawData.invoiceTotalPaid));
-      const totalItems = sumItems(sanitizedItems);
-      const difference = roundMoney(invoiceTotalPaid - totalItems);
-      const notes = Array.isArray(rawData.notes) ? rawData.notes.map(String) : [];
-
-      if (Math.abs(difference) > 0.01) {
-        notes.push(`Diferencia por revisar: factura ${invoiceTotalPaid.toFixed(2)} vs items ${totalItems.toFixed(2)}.`);
-      }
-      const newResult: InvoiceResult = {
-        id: crypto.randomUUID(),
-        fileName: selectedFile.name,
-        source: isXml ? "SRI_RECEIVED" : "AI_UPLOAD",
-        category: isXml ? "INVENTARIO" : "REVISION",
-        supplier: rawData.supplier || "Desconocido",
-        supplierRuc: rawData.supplierRuc || "",
-        invoiceNumber: rawData.invoiceNumber || "",
-        invoiceDate: rawData.invoiceDate || "",
-        accessKey: rawData.accessKey || "",
-        authorizationDate: rawData.authorizationDate || "",
-        sriReceptionStatus: isXml ? sriReceptionStatus(sanitizedItems, difference) : undefined,
-        invoiceTotalPaid,
-        currency: "USD",
-        items: sanitizedItems,
-        status: sanitizedItems.length > 0 && Math.abs(difference) <= 0.01 ? "OK" : "REVIEW",
-        difference,
-        notes,
-      };
-
-      setProgress(95);
-      setLoadingPhase("Finalizando...");
-
-      const saveResponse = await fetch("/api/invoices", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(newResult),
-      });
-
-      if (!saveResponse.ok) {
-        const payload = await saveResponse.json().catch(() => null);
-        throw new Error(payload?.error || "La factura se extrajo, pero no se pudo guardar.");
       }
 
-      const savedResult = await saveResponse.json();
-      setResults(prev => [savedResult, ...prev.filter(r => r.id !== savedResult.id)]);
-      await loadProducts();
-      setSelectedFile(null);
+      setSelectedFiles([]);
       setProgress(100);
-      
+      setLoadingPhase("Finalizado");
+
+      if (failedFiles.length > 0) {
+        setError(`No se pudieron procesar ${failedFiles.length} archivo(s): ${failedFiles.join(" | ")}`);
+      }
+
       setTimeout(() => {
         setIsLoading(false);
         setProgress(0);
         setLoadingPhase("");
       }, 500);
     } catch (err) {
-      console.error("Error processing file:", err);
+      console.error("Error processing files:", err);
       setError(`Error al procesar: ${friendlyProcessingError(err)}`);
       setIsLoading(false);
       setProgress(0);
@@ -535,9 +553,13 @@ export default function App() {
   };
 
   const filteredRows = useMemo(() => {
-    const visibleInvoices = categoryFilter === "TODAS"
+    let visibleInvoices = categoryFilter === "TODAS"
       ? results
       : results.filter((invoice) => (invoice.category || "SIN_CATEGORIA") === categoryFilter);
+
+    if (loadedInvoiceIds.size > 0) {
+      visibleInvoices = visibleInvoices.filter((invoice) => loadedInvoiceIds.has(invoice.id));
+    }
 
     let allRows = visibleInvoices.flatMap(invoice => 
       invoice.items.map((item, idx) => ({ 
@@ -586,7 +608,7 @@ export default function App() {
     }
     
     return allRows;
-  }, [results, searchQuery, sortField, sortOrder, columnSearch, categoryFilter]);
+  }, [results, searchQuery, sortField, sortOrder, columnSearch, categoryFilter, loadedInvoiceIds]);
 
   const totalInvoiceSum = useMemo(() => 
     roundMoney(filteredRows.reduce((acc, curr) => acc + curr.finalTotalCost, 0)), 
@@ -620,7 +642,7 @@ export default function App() {
 
   const sriInvoices = useMemo(
     () => {
-      const sourceInvoices = results.filter((invoice) => invoice.source === "SRI_RECEIVED" || invoice.fileName.toLowerCase().endsWith(".xml"));
+      const sourceInvoices = results;
       return categoryFilter === "TODAS"
         ? sourceInvoices
         : sourceInvoices.filter((invoice) => (invoice.category || "SIN_CATEGORIA") === categoryFilter);
@@ -635,6 +657,55 @@ export default function App() {
     (acc, invoice) => acc + invoice.items.filter((item) => !item.barcode).length,
     0,
   );
+  const visibleUploadedInvoices = useMemo(() => {
+    const filtered = showOnlySelectedUploads
+      ? sriInvoices.filter((invoice) => selectedInvoiceIds.has(invoice.id))
+      : sriInvoices;
+    return filtered;
+  }, [sriInvoices, selectedInvoiceIds, showOnlySelectedUploads]);
+  const selectedInvoicesTotal = roundMoney(
+    results
+      .filter((invoice) => selectedInvoiceIds.has(invoice.id))
+      .reduce((acc, invoice) => acc + invoice.invoiceTotalPaid, 0),
+  );
+
+  const toggleInvoiceSelection = (invoiceId: string) => {
+    setSelectedInvoiceIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(invoiceId)) {
+        next.delete(invoiceId);
+      } else {
+        next.add(invoiceId);
+      }
+      return next;
+    });
+  };
+
+  const toggleAllVisibleInvoices = () => {
+    setSelectedInvoiceIds((prev) => {
+      const next = new Set(prev);
+      const allVisibleSelected = visibleUploadedInvoices.length > 0 && visibleUploadedInvoices.every((invoice) => next.has(invoice.id));
+
+      if (allVisibleSelected) {
+        visibleUploadedInvoices.forEach((invoice) => next.delete(invoice.id));
+      } else {
+        visibleUploadedInvoices.forEach((invoice) => next.add(invoice.id));
+      }
+
+      return next;
+    });
+  };
+
+  const loadSelectedInvoicesIntoSystem = async () => {
+    if (selectedInvoiceIds.size === 0) {
+      setError("Selecciona una o mas facturas para cargarlas al sistema.");
+      return;
+    }
+
+    const selectedInvoices = results.filter((invoice) => selectedInvoiceIds.has(invoice.id));
+    setLoadedInvoiceIds(new Set(selectedInvoices.map((invoice) => invoice.id)));
+    setError(null);
+  };
 
   const updateInvoiceCategory = async (invoice: InvoiceResult, category: InvoiceCategory) => {
     const updatedInvoice = { ...invoice, category };
@@ -729,7 +800,10 @@ export default function App() {
         throw new Error(payload?.error || "No se pudo limpiar el historial.");
       }
 
-      setSelectedFile(null);
+      setSelectedFiles([]);
+      setSelectedInvoiceIds(new Set());
+      setLoadedInvoiceIds(new Set());
+      setShowOnlySelectedUploads(false);
       setResults([]);
       setSortField(null);
       setSortOrder(null);
@@ -812,6 +886,7 @@ export default function App() {
                 type="file" 
                 className="hidden" 
                 onChange={(e) => handleFileUpload(e.target.files)}
+                multiple
                 accept="image/*,.pdf,.xml,.txt,text/plain,text/xml,application/xml"
               />
               <div className="bg-slate-800 p-4 rounded-full mb-4 group-hover:scale-110 transition-transform">
@@ -822,10 +897,22 @@ export default function App() {
                 XML, reporte TXT SRI, fotos, PDF o <span className="text-cyan-500 underline decoration-cyan-500/30 underline-offset-2">pega una imagen</span>
               </p>
               
-              {selectedFile && (
-                <div className="mt-6 flex items-center gap-2 rounded-lg bg-cyan-500/10 px-3 py-2 text-[10px] text-cyan-400 font-black border border-cyan-500/20 shadow-[0_0_15px_rgba(34,211,238,0.1)]">
-                  <FileText className="h-3.5 w-3.5" />
-                  <span className="truncate max-w-[150px]">{selectedFile.name}</span>
+              {selectedFiles.length > 0 && (
+                <div className="mt-6 w-full max-w-[260px] space-y-2">
+                  <div className="rounded-lg bg-cyan-500/10 px-3 py-2 text-[10px] text-cyan-400 font-black border border-cyan-500/20 shadow-[0_0_15px_rgba(34,211,238,0.1)]">
+                    {selectedFiles.length} archivo(s) listos
+                  </div>
+                  <div className="max-h-24 overflow-auto custom-scrollbar space-y-1">
+                    {selectedFiles.slice(0, 5).map((file, index) => (
+                      <div key={`${file.name}-${file.lastModified}-${index}`} className="flex items-center gap-2 rounded bg-slate-950/70 px-2 py-1 text-[9px] text-slate-400">
+                        <FileText className="h-3 w-3 text-cyan-500" />
+                        <span className="truncate">{file.name}</span>
+                      </div>
+                    ))}
+                    {selectedFiles.length > 5 && (
+                      <div className="text-[9px] font-bold text-slate-600">+{selectedFiles.length - 5} mas</div>
+                    )}
+                  </div>
                 </div>
               )}
             </div>
@@ -868,8 +955,8 @@ export default function App() {
                 Limpiar
               </button>
               <button 
-                onClick={processFile}
-                disabled={!selectedFile || isLoading}
+                onClick={processFiles}
+                disabled={selectedFiles.length === 0 || isLoading}
                 className="flex items-center justify-center rounded-xl bg-cyan-600 py-3.5 text-[10px] font-black uppercase tracking-widest text-white shadow-[0_0_20px_rgba(8,145,178,0.2)] hover:bg-cyan-500 transition disabled:opacity-30 disabled:grayscale transition-all overflow-hidden"
               >
                 {isLoading ? (
@@ -909,7 +996,7 @@ export default function App() {
             <section className="border-b border-slate-800/60 bg-slate-950/30 p-4 space-y-4">
               <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
                 <div>
-                  <div className="text-[10px] font-black uppercase tracking-[0.3em] text-cyan-500">Archivo SRI</div>
+                  <div className="text-[10px] font-black uppercase tracking-[0.3em] text-cyan-500">Archivo</div>
                   <h2 className="text-lg font-black uppercase tracking-tight text-white">Facturas y productos</h2>
                 </div>
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[10px] font-black uppercase">
@@ -932,25 +1019,32 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="grid gap-2 md:grid-cols-4">
-                {["Subir TXT/XML", "Clasificar", "Revisar productos", "Guardar historial"].map((step, index) => (
-                  <div key={step} className="flex items-center gap-2 rounded-lg border border-slate-800 bg-slate-900/50 px-3 py-2">
-                    <div className={`flex h-6 w-6 items-center justify-center rounded-full text-[10px] font-black ${index < 3 ? "bg-cyan-500/20 text-cyan-400" : "bg-slate-800 text-slate-500"}`}>
-                      {index + 1}
-                    </div>
-                    <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">{step}</span>
-                  </div>
-                ))}
-              </div>
-
               <div className="grid gap-3 rounded-xl border border-slate-800 bg-slate-950/40 p-4">
-                <div className="grid gap-3 md:grid-cols-[1fr_auto]">
+                <div className="grid gap-3 lg:grid-cols-[1fr_auto_auto] lg:items-center">
                   <div>
-                    <div className="text-[10px] font-black uppercase tracking-[0.25em] text-slate-500">Reporte TXT SRI</div>
-                    <p className="mt-1 text-xs font-bold text-slate-300">
-                      Descarga el reporte TXT desde el SRI y subelo como archivo. Las facturas se guardan en Revision; al subir XML, foto o PDF se guardan tambien sus productos y ultimo costo.
-                    </p>
+                    <div className="flex items-center gap-2 text-[10px] font-black uppercase tracking-[0.25em] text-cyan-500">
+                      <ClipboardList className="h-3.5 w-3.5" />
+                      Facturas subidas
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-2 text-[10px] font-black uppercase">
+                      <span className="rounded bg-slate-900 px-2 py-1 text-slate-500">Seleccionadas: {selectedInvoiceIds.size}</span>
+                      <span className="rounded bg-cyan-500/10 px-2 py-1 text-cyan-400">Total: ${selectedInvoicesTotal.toFixed(2)}</span>
+                      {loadedInvoiceIds.size > 0 && (
+                        <span className="rounded bg-green-500/10 px-2 py-1 text-green-400">Cargadas abajo: {loadedInvoiceIds.size}</span>
+                      )}
+                    </div>
                   </div>
+
+                  <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-slate-800 bg-slate-950 px-3 py-3 text-[10px] font-black uppercase text-slate-300">
+                    <input
+                      type="checkbox"
+                      checked={showOnlySelectedUploads}
+                      onChange={(event) => setShowOnlySelectedUploads(event.target.checked)}
+                      className="h-4 w-4 accent-cyan-500"
+                    />
+                    Mostrar seleccionadas
+                  </label>
+
                   <select
                     value={categoryFilter}
                     onChange={(event) => setCategoryFilter(event.target.value as InvoiceCategory | "TODAS")}
@@ -962,26 +1056,69 @@ export default function App() {
                     ))}
                   </select>
                 </div>
+
+                <div className="flex flex-col gap-2 sm:flex-row">
+                  <button
+                    type="button"
+                    onClick={toggleAllVisibleInvoices}
+                    disabled={visibleUploadedInvoices.length === 0}
+                    className="flex items-center justify-center gap-2 rounded-lg border border-slate-800 bg-slate-950 px-4 py-2.5 text-[10px] font-black uppercase tracking-widest text-slate-400 transition hover:bg-slate-900 hover:text-white disabled:opacity-30"
+                  >
+                    <Check className="h-3.5 w-3.5" />
+                    Seleccionar visibles
+                  </button>
+                  <button
+                    type="button"
+                    onClick={loadSelectedInvoicesIntoSystem}
+                    disabled={selectedInvoiceIds.size === 0}
+                    className="flex items-center justify-center gap-2 rounded-lg bg-cyan-600 px-4 py-2.5 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-cyan-500 disabled:opacity-30"
+                  >
+                    <Archive className="h-3.5 w-3.5" />
+                    Cargar seleccionadas al sistema
+                  </button>
+                  {loadedInvoiceIds.size > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setLoadedInvoiceIds(new Set())}
+                      className="flex items-center justify-center gap-2 rounded-lg border border-slate-800 bg-slate-950 px-4 py-2.5 text-[10px] font-black uppercase tracking-widest text-slate-400 transition hover:bg-slate-900 hover:text-white"
+                    >
+                      Ver todas abajo
+                    </button>
+                  )}
+                </div>
               </div>
 
               <div className="rounded-xl border border-slate-800 overflow-hidden">
-                <div className="grid grid-cols-[1.2fr_0.8fr_0.8fr_0.8fr] gap-2 bg-slate-950 px-4 py-2 text-[9px] font-black uppercase tracking-widest text-slate-600">
-                  <span>Proveedor</span>
+                <div className="grid grid-cols-[44px_1.2fr_0.8fr_0.8fr_0.7fr] gap-2 bg-slate-950 px-4 py-2 text-[9px] font-black uppercase tracking-widest text-slate-600">
+                  <span></span>
+                  <span>Factura</span>
                   <span>Categoria</span>
                   <span>Productos</span>
                   <span className="text-right">Total</span>
                 </div>
-                <div className="max-h-52 overflow-auto custom-scrollbar divide-y divide-slate-800">
-                  {sriInvoices.length === 0 ? (
+                <div className="max-h-72 overflow-auto custom-scrollbar divide-y divide-slate-800">
+                  {visibleUploadedInvoices.length === 0 ? (
                     <div className="px-4 py-8 text-center text-[10px] font-black uppercase tracking-widest text-slate-700">
-                      Sube reporte TXT, XML, foto o PDF para alimentar este modulo
+                      Sube TXT, XML, fotos o PDF para ver facturas guardadas
                     </div>
                   ) : (
-                    sriInvoices.slice(0, 6).map((invoice) => (
-                      <div key={invoice.id} className="grid grid-cols-[1.2fr_0.8fr_0.8fr_0.8fr] gap-2 px-4 py-3 text-[11px]">
-                        <div>
-                          <strong className="block text-slate-200 uppercase">{invoice.supplier || "Proveedor"}</strong>
-                          <span className="text-slate-600">{invoice.supplierRuc || invoice.invoiceNumber || "Sin RUC"}</span>
+                    visibleUploadedInvoices.map((invoice) => (
+                      <div
+                        key={invoice.id}
+                        className={`grid grid-cols-[44px_1.2fr_0.8fr_0.8fr_0.7fr] gap-2 px-4 py-3 text-[11px] ${loadedInvoiceIds.has(invoice.id) ? "bg-cyan-500/5" : ""}`}
+                      >
+                        <label className="flex items-center">
+                          <input
+                            type="checkbox"
+                            checked={selectedInvoiceIds.has(invoice.id)}
+                            onChange={() => toggleInvoiceSelection(invoice.id)}
+                            className="h-4 w-4 accent-cyan-500"
+                            aria-label={`Seleccionar factura ${invoice.invoiceNumber || invoice.fileName}`}
+                          />
+                        </label>
+                        <div className="min-w-0">
+                          <strong className="block truncate text-slate-200 uppercase">{invoice.supplier || "Proveedor"}</strong>
+                          <span className="block truncate text-slate-600">{invoice.invoiceNumber || invoice.fileName}</span>
                         </div>
                         <select
                           value={invoice.category || "SIN_CATEGORIA"}
@@ -1006,33 +1143,6 @@ export default function App() {
                 </div>
               )}
 
-              <div className="rounded-xl border border-slate-800 overflow-hidden">
-                <div className="grid grid-cols-[1.4fr_0.8fr_0.7fr_0.8fr] gap-2 bg-slate-950 px-4 py-2 text-[9px] font-black uppercase tracking-widest text-slate-600">
-                  <span>Producto</span>
-                  <span>Proveedor</span>
-                  <span className="text-right">Ult. costo</span>
-                  <span className="text-right">Compras</span>
-                </div>
-                <div className="max-h-44 overflow-auto custom-scrollbar divide-y divide-slate-800">
-                  {products.length === 0 ? (
-                    <div className="px-4 py-6 text-center text-[10px] font-black uppercase tracking-widest text-slate-700">
-                      Los productos apareceran al subir XML, foto o PDF con detalle
-                    </div>
-                  ) : (
-                    products.slice(0, 8).map((product) => (
-                      <div key={product.id} className="grid grid-cols-[1.4fr_0.8fr_0.7fr_0.8fr] gap-2 px-4 py-3 text-[11px]">
-                        <div>
-                          <strong className="block truncate text-slate-200 uppercase">{product.product}</strong>
-                          <span className="font-mono text-[9px] text-slate-600">{product.barcode || "Sin codigo"}</span>
-                        </div>
-                        <span className="truncate text-slate-500">{product.supplier || "Proveedor"}</span>
-                        <strong className="text-right text-cyan-400">${Number(product.lastUnitCost || 0).toFixed(4)}</strong>
-                        <span className="text-right text-slate-400">{product.purchaseCount}</span>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
             </section>
 
             {/* Search and Export */}
