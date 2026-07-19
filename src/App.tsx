@@ -613,25 +613,33 @@ export default function App() {
   const totalInvoiceSum = useMemo(() => 
     roundMoney(filteredRows.reduce((acc, curr) => acc + curr.finalTotalCost, 0)), 
   [filteredRows]);
+  const totalFilteredQuantity = useMemo(
+    () => filteredRows.reduce((acc, curr) => acc + Number(curr.quantity || 0), 0),
+    [filteredRows],
+  );
+  const weightedUnitCost = useMemo(
+    () => totalFilteredQuantity > 0 ? roundMoney(totalInvoiceSum / totalFilteredQuantity) : 0,
+    [totalFilteredQuantity, totalInvoiceSum],
+  );
 
   const aggResult = useMemo(() => {
     if (filteredRows.length === 0) return 0;
     
     switch (aggType) {
       case "count": return filteredRows.length;
-      case "avg": return roundMoney(filteredRows.reduce((acc, curr) => acc + curr.finalTotalCost, 0) / filteredRows.length);
+      case "avg": return weightedUnitCost;
       case "min": return Math.min(...filteredRows.map(r => r.finalTotalCost));
       case "max": return Math.max(...filteredRows.map(r => r.finalTotalCost));
       case "sum":
       default:
-        return roundMoney(filteredRows.reduce((acc, curr) => acc + curr.finalTotalCost, 0));
+        return totalInvoiceSum;
     }
-  }, [filteredRows, aggType]);
+  }, [filteredRows, aggType, totalInvoiceSum, weightedUnitCost]);
 
   const aggLabel = useMemo(() => {
     switch (aggType) {
       case "count": return "Número de elementos";
-      case "avg": return "Promedio";
+      case "avg": return "Costo Unit.";
       case "min": return "Mínimo";
       case "max": return "Máximo";
       case "sum":
@@ -1452,10 +1460,10 @@ export default function App() {
                         Resultados de Columnas
                       </td>
                       <td className="px-6 py-4 text-right text-slate-300 border-r border-slate-800/50 tabular-nums">
-                        {filteredRows.reduce((a, b) => a + b.quantity, 0)}
+                        {totalFilteredQuantity}
                       </td>
                       <td className="px-6 py-4 text-right text-cyan-500/60 border-r border-slate-800/50 tabular-nums italic">
-                        AVG: ${(filteredRows.reduce((a, b) => a + b.finalUnitCost, 0) / filteredRows.length).toFixed(4)}
+                        UNIT: ${weightedUnitCost.toFixed(4)}
                       </td>
                       <td 
                         className="px-6 py-4 text-right text-cyan-400 cursor-pointer bg-cyan-950/10 hover:bg-cyan-900/20 transition-colors border-r border-slate-800/50"
@@ -1515,7 +1523,7 @@ export default function App() {
                         {[
                           { id: "sum", label: "Suma" },
                           { id: "count", label: "Número de elementos" },
-                          { id: "avg", label: "Promedio" },
+                          { id: "avg", label: "Costo unitario" },
                           { id: "min", label: "Mínimo" },
                           { id: "max", label: "Máximo" },
                         ].map((opt) => (
@@ -1534,7 +1542,7 @@ export default function App() {
                 </div>
                 <div className="text-6xl font-black text-white tabular-nums tracking-tighter glow-text leading-none">
                   {aggType === 'sum' || aggType === 'avg' || aggType === 'min' || aggType === 'max' ? '$' : ''}
-                  {aggType === 'count' ? aggResult : aggResult.toFixed(2)}
+                  {aggType === 'count' ? aggResult : aggType === 'avg' ? aggResult.toFixed(4) : aggResult.toFixed(2)}
                 </div>
               </div>
             </div>
